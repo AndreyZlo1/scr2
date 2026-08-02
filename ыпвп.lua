@@ -1,4 +1,4 @@
---[[ PRACTICAL BASKETBALL v151 — Potassium/UNC — модуль для лоадера Syllinse ]]
+--[[ PRACTICAL BASKETBALL v152 — Potassium/UNC — модуль для лоадера Syllinse ]]
 
 -- Luraph macro prelude. Installed through STRING KEYS on the global env so a
 -- bare macro token never appears in real code (that would abort Luraph). Raw,
@@ -20,7 +20,7 @@ do
   end
 end
 
-local VERSION = 151
+local VERSION = 152
 
 local CFG = {
 
@@ -302,10 +302,20 @@ local CFG = {
 
     GroundWait = 0.90,
 
-    ApexMin    = 0.4,
+    -- ЗАМЕР ПРЫЖКА: ГРАНИЦЫ И ЗАПАСНОЕ ЗНАЧЕНИЕ.
+    -- Апекс замерялся в четырёх дампах подряд: 4.30, 4.60, 4.65, 4.65. Ниже
+    -- 2.5 законных значений не бывает — такой замер это сорванный прыжок
+    -- (приземлились на кого-то, игра обрезала). Раньше нижняя граница стояла
+    -- на 0.4, и один такой выброс (1.89) утягивал среднее вниз.
+    ApexMin    = 2.5,
     ApexMax    = 16.0,
     ApexMinN   = 2,
-    ApexGuess  = 1.5,
+    -- ЗАПАСНОЕ ЗНАЧЕНИЕ ДО ДВУХ УДАЧНЫХ ЗАМЕРОВ.
+    -- Стояло 1.5, и это давало досягаемость 1.5 + 3.5 = 5.0 студа. В дампе
+    -- ровно так: reachY = 5.0, и следом "no reachable point in 3.2..5.0",
+    -- плюс 318 отказов "ball above our reach". То есть пока замер не набрался,
+    -- перехват отказывался почти от всего. Ставим измеренное значение.
+    ApexGuess  = 4.5,
     ApexWatch  = 1.2,
 
     ReachMin   = 4.0,
@@ -377,6 +387,9 @@ local CFG = {
     -- прыжок (InAir). Радиус — на каком расстоянии считаем, что он на нём.
     SkipCovered = true,
     CoveredRad  = 12.0,
+    -- Насколько напарник может стоять в стороне от прямой «носитель —
+    -- наше кольцо» и всё ещё считаться закрывающим проход.
+    CoveredLane = 4.0,
     -- Скорость передвижения на защите, пишется в скорость напрямую.
     -- 0 = не вмешиваться и идти как игра позволяет (потолок 14 + спринт 3.35).
     MoveSpeed = 0,
@@ -1314,6 +1327,10 @@ function PBX.ballDead()
   if (now - D.at) < 0.1 then return D.v, D.why end
   D.at, D.v, D.why = now, false, nil
 
+  if PBX.ballOut and PBX.ballOut() then
+    D.v, D.why = true, "the ball is out of bounds"
+    return D.v, D.why
+  end
   local w = CFG.Grab.DeadAfterScore
   if w > 0 and HUB.scoredAt and (now - HUB.scoredAt) < w then
     D.v, D.why = true, ("the ball just went in, %.1f s left"):format(w - (now - HUB.scoredAt))
@@ -1571,6 +1588,7 @@ local function hoopWeDefend()
   return v
 end
 
+PBX.hoopDef = hoopWeDefend
 function PBX.hoopWeDefendRaw()
   local list = hoopList()
   if #list == 1 then
@@ -2897,6 +2915,25 @@ local updateBall = LPH_NO_VIRTUALIZE(function()
       BALL.release = best.pos
     end
     BALL.part, BALL.pos, BALL.vel, BALL.speed = best.part, best.pos, best.vel, best.speed
+    -- ГОЛ ЗАСЕКАЕМ ПО ФАКТУ, А НЕ ПО ПРЕДСКАЗАНИЮ.
+    -- Прошлый признак срабатывал в момент КОНЦА полёта и читал дугу. Но к
+    -- тому времени мяч уже прыгает по площадке, дуга описывает именно это, и
+    -- hits давно false. В дампе это три засечённых гола за всю сессию при
+    -- шестнадцати своих бросках. Считаем иначе, напрямую: мяч опустился до
+    -- уровня кольца, идёт ВНИЗ, и по горизонтали он внутри радиуса
+    -- засчитывания — то есть физически прошёл сквозь дужку.
+    if best.vel.Y < -1 then
+      for _, hp2 in ipairs(hoopList()) do
+        if best.pos.Y <= hp2.Y and best.pos.Y >= hp2.Y - 3.0
+           and ((best.pos - hp2) * FLAT).Magnitude <= CFG.Traj.ScoreRad then
+          if (now - (HUB.scoredAt or -99)) > 1.5 then
+            HUB.scoredAt = now
+            HUB.scoredN = (HUB.scoredN or 0) + 1
+          end
+          break
+        end
+      end
+    end
     BALL.velSrc, BALL.stale = best.src, best.stale
     BALL.fitN = best.fitN
     BALL.state = "flight"
@@ -2943,15 +2980,6 @@ local updateBall = LPH_NO_VIRTUALIZE(function()
 
     BALL.stale = (BALL.stale or 0) + (now - (BALL.lastTick or now))
   else
-    -- ПОПАДАНИЕ ЗАСЕКАЕМ ЗДЕСЬ: дуга говорила «заходит», и полёт кончился.
-    -- Это единственный момент, где мы можем узнать про гол своими силами.
-    -- Берём вердикт ИЗ САМОЙ ДУГИ этого полёта, а не глобальный hitsStable:
-    -- тот остаётся от прошлого владения и на коротком полёте дал бы ложный гол.
-    if BALL.state == "flight" and HUB.arc and HUB.arc.hits == true
-       and HUB.arc.ball == BALL.part and (now - (BALL.tFlight or 0)) > 0.3 then
-      HUB.scoredAt = now
-      HUB.scoredN = (HUB.scoredN or 0) + 1
-    end
     -- МЯЧ ОСТАНОВИЛСЯ, НО ОН ВСЁ ЕЩЁ ГДЕ-ТО ЛЕЖИТ.
     -- Раньше при потере скорости состояние уходило в idle, а BALL.pos
     -- оставался с ПОСЛЕДНЕГО кадра полёта. Ветка подбора у кольца читает
@@ -4074,6 +4102,19 @@ function SLIP.pastBarrier(me, q)
 end
 
 SLIP.vtrack = {}
+-- МЯЧ УЛЕТЕЛ ЗА ПРЕДЕЛЫ ПЛОЩАДКИ.
+-- Между ним и кольцом, которое мы защищаем, стоит бортик — значит он в ауте,
+-- и до вбрасывания его никто не поднимет. Барьеры площадки у нас уже собраны
+-- для обхода в Contact Slip, тем же лучом и пользуемся. Зовётся не чаще
+-- десяти раз в секунду, из PBX.ballDead.
+function PBX.ballOut()
+  local bp = BALL.pos
+  if not bp then return false end
+  local hp = PBX.hoopDef and PBX.hoopDef() or nil
+  if not hp then return false end
+  return SLIP.pastBarrier(bp, hp)
+end
+
 function SLIP.foeVel(c, p, now)
   local e = SLIP.vtrack[c]
   if not e then
@@ -6480,21 +6521,44 @@ end
 -- Возвращает того самого напарника и словами, чем он занят. Считаем прикрытым
 -- только если напарник НЕ ДАЛЬШЕ нас: если мы ближе, основной защитник всё-
 -- таки мы, и отдавать соперника было бы хуже, чем взять вдвоём.
-function PBX.coveredByMate(cp, myDist)
+function PBX.coveredByMate(cp, hp)
   local D = CFG.Defense
   if not (D.SkipCovered and cp) then return nil end
   local rad = D.CoveredRad
+  -- УСЛОВИЕ «ТИММЕЙТ НЕ ДАЛЬШЕ НАС» УБРАНО, И ЭТО БЫЛА МОЯ ОШИБКА.
+  -- Я добавил его от себя. По журналу мы стоим от носителя в 3..5 студах —
+  -- значит напарнику надо было оказаться ещё ближе И при этом держать
+  -- стойку. За всю сессию условие сошлось 357 раз при десятках тысяч тиков,
+  -- то есть функция почти не работала. Радиус и есть всё правило.
+  local u = nil
+  if hp then
+    local v = (hp - cp) * FLAT
+    if v.Magnitude > 0.5 then u = v.Unit end
+  end
   for _, c in ipairs(charsList()) do
     if isMate(c) then
       local p = posOf(sChild(c, "HumanoidRootPart"))
       if p then
-        local d = ((p - cp) * FLAT).Magnitude
-        if d <= rad and (not myDist or d <= myDist) then
+        local rel = (p - cp) * FLAT
+        if rel.Magnitude <= rad then
           if sAttr(c, "HoldingG") == true then return c, "in stance" end
           local a = sAttr(c, "Action")
           if a == "Blocking" then return c, "blocking" end
           if a == "Stealing" then return c, "going for the steal" end
           if sAttr(c, "InAir") == true then return c, "in the air on him" end
+          -- И ПРОСТО СТОЯТЬ НА ЛИНИИ — ЭТО ТОЖЕ ЗАЩИТА.
+          -- Стойку живой игрок держит редко, а закрывать проход телом —
+          -- постоянно. Если напарник между носителем и нашим кольцом и не
+          -- сильно в стороне от прямой, соперник уже занят.
+          if u then
+            local along = rel:Dot(u)
+            if along > 0 then
+              local lat = (rel - u * along).Magnitude
+              if lat <= D.CoveredLane then
+                return c, ("on the line, %.1f in front"):format(along)
+              end
+            end
+          end
         end
       end
     end
@@ -6611,7 +6675,7 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
         else
           local d = ((cp-me)*FLAT).Magnitude
           if d <= CFG.Defense.Engage then
-            local mate, doing = PBX.coveredByMate(cp, d)
+            local mate, doing = PBX.coveredByMate(cp, hoopWeDefend())
             if mate then
               covered += 1
               coveredWhy = ("%s already has %s (%s)")
@@ -8916,7 +8980,11 @@ return function(_Lib, _Core)
       slider(s1, { Name = "Counts As Covered", Flag = "DEF_CoveredRad",
         Default = CFG.Defense.CoveredRad, Min = 4, Max = 25, Precision = 1,
         Callback = function(v) CFG.Defense.CoveredRad = v end,
-        Desc = "how close the mate has to be, and he must be no further than you" })
+        Desc = "how close the mate has to be to the attacker to count as guarding him" })
+      slider(s1, { Name = "Covered Lane", Flag = "DEF_CoveredLane",
+        Default = CFG.Defense.CoveredLane, Min = 0, Max = 10, Precision = 1,
+        Callback = function(v) CFG.Defense.CoveredLane = v end,
+        Desc = "a mate standing this near the line to your hoop counts even without a stance" })
       slider(s1, { Name = "Walk Around Him", Flag = "DEF_Around", Default = CFG.Defense.WalkAround,
         Min = 0, Max = 8, Precision = 1,
         Callback = function(v) CFG.Defense.WalkAround = v end,
