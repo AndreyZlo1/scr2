@@ -20,7 +20,7 @@ do
   end
 end
 
-local VERSION = 155
+local VERSION = 156
 
 local CFG = {
 
@@ -45,6 +45,21 @@ local CFG = {
   -- середину уводил выстрел на 6.5 мс раньше, это 0.020 метра при ширине
   -- окна Perfect около 0.02 — целое окно мимо.
   TickEarly = 0.25,
+  -- ПРИЦЕЛИВАТЬСЯ ЛИ В СЕРЕДИНУ ТИКА ВООБЩЕ.
+  -- Снап придумывался на случай, если сервер меряет метр СВОИМИ тиками: тогда
+  -- выстрел ровно на границе может попасть в любой из двух, и середина даёт
+  -- максимальный запас. Проверка по трассам этого дампа: атрибут meterOffset
+  -- приходит ровно каждые 1/60 (шаг метра 0.045 при скорости 2.7), то есть 60
+  -- Гц — это ЧАСТОТА РЕПЛИКАЦИИ, а сам метр сервер считает непрерывно от
+  -- ShotStartTime вместе с ShotSpeed. Значит середина тика ничего не защищает,
+  -- а только добавляет разброс: смещение равно (0.5 - дробная часть) тика, то
+  -- есть от -8.3 до +8.3 мс, в единицах метра ±0.022. Замеренное окно Perfect
+  -- (1.5151..1.5188) ВСЕГО 0.0037 шириной — разброс от снапа больше окна в
+  -- шесть раз. Три броска этого дампа: +0.0130, +0.0140, -0.0045 от цели, и
+  -- все три промахнулись мимо Perfect ровно на величину снапа. Стреляем точно
+  -- по пересечению. Ключ оставлен, чтобы вернуть прежнее поведение без правки
+  -- кода, если замер покажет обратное.
+  SnapTick  = false,
 
   UseFittedRate = true,
 
@@ -67,6 +82,9 @@ local CFG = {
   ClockCoef = 0.7572,
   ClockSlack= 0.15,
   SpinWindow= 0.020,
+  -- Потолок активного ожидания. Спин блокирует кадр целиком, поэтому больше
+  -- одного кадра на низком фпс держать нельзя, а меньше кадра — бессмысленно.
+  SpinMax   = 0.050,
   StaleMax  = 0.25,
   PhaseSane = 0.60,
 
@@ -389,9 +407,12 @@ local CFG = {
     -- прыжок (InAir). Радиус — на каком расстоянии считаем, что он на нём.
     SkipCovered = true,
     CoveredRad  = 12.0,
-    -- Насколько напарник может стоять в стороне от прямой «носитель —
-    -- наше кольцо» и всё ещё считаться закрывающим проход.
-    CoveredLane = 4.0,
+    -- НА КОМ ИМЕННО ОН ДЕРЖИТ ЗАЩИТУ.
+    -- Стойка — это состояние игрока, а не привязка к сопернику. Напарник в
+    -- пятнадцати студах может стоять в стойке на СВОЁМ подопечном, а мы
+    -- засчитывали её носителю и не шли вообще ни на кого. Считаем, что он
+    -- держит другого, если тот ближе к нему больше чем на столько студов.
+    CoveredOwn  = 2.0,
     -- Сколько держим уже принятое решение «его ведёт напарник». Без этого
     -- выбор мигает каждый кадр вместе с его стойкой, и мы дёргаемся на месте.
     CoveredHold = 1.5,
@@ -618,8 +639,22 @@ local CFG = {
     -- Ближе этого до точки спринт снимаем, чтобы не проскочить её.
     SprintOff = 2.0,
 
-    Stance   = false,
+    -- СТОЙКА В AUTO MOVE БЫЛА МЁРТВЫМ КОДОМ.
+    -- Ключ стоял в false и НИ ОДНОГО элемента интерфейса на него заведено не
+    -- было — включить её было нельзя в принципе. А стойка это не «медленнее,
+    -- зато полезнее»: по Types/Guard шаг равен потолку ходьбы +2.5 (16.5)
+    -- против 14 у Base, спринт +3.5 против +3.35, и главное — Base режет
+    -- любое движение не вперёд: слагаемое (MoveDir·Look-1)*2 отнимает до
+    -- четырёх, а forwardValue < 0.5 делит ещё на 1.35, то есть приставной шаг
+    -- назад идёт около 7.4. В стойке те же направления стоят 0.95 и 1.05 от
+    -- полной скорости. Под кольцом и на подборе мы двигаемся именно вбок.
+    Stance   = true,
     StanceRad= 6.0,
+    -- Держать стойку и когда носителя рядом нет, а мы просто стоим у кольца.
+    -- Movement:449: при HoldingG и пустом Action игра сама выбирает режим —
+    -- есть соперник в 16.5 будет Guard, нет, но есть в 45 будет BoxoutPlayer,
+    -- то есть вытеснение под щитом. На подборе это ровно то, что нужно.
+    RimStance= true,
     Steal    = false,
     StealRad = 4.0,
     StealCD  = 1.2,
@@ -883,6 +918,64 @@ local function proxyPart() return sChild(Workspace, "ProxyCharacter") end
 local function holdRelease()
   local c = chr(); if not c then return end
   pcall(function() c:SetAttribute("CFrame", nil) end)
+end
+
+-- ОДНА СТОЙКА НА ВЕСЬ СКРИПТ, ОДИН ВЛАДЕЛЕЦ ПАКЕТА.
+-- Стойку жали ТРИ системы, каждая своим флагом и своим FireServer: Auto
+-- Defense (HUB.holdG), Auto Move (HUB.autoStance) и Contest Shooter
+-- (BL.heldG). Пока они хотели одного и того же, всё сходилось. Стоило
+-- разойтись — и HoldingG=true от одной тут же гасился HoldingG=false от
+-- другой, каждый кадр, обеими сторонами: стойки нет ни у кого, зато канал
+-- забит. Самый частый случай: Auto Defense уступил соперника напарнику и на
+-- выходе снял стойку, хотя игрок остался стоять в защите.
+-- Теперь запросы СКЛАДЫВАЮТСЯ: стойка стоит, пока её хочет хоть кто-то,
+-- пакет уходит только на смену состояния, а «отпустить» разрешено лишь
+-- тому, кто её сам и поставил.
+HUB.gReq = {}
+-- sec = на сколько секунд владелец просит стойку (просьбу надо продлевать
+-- каждый кадр), nil или 0 = снять свою просьбу.
+function PBX.wantG(owner, sec)
+  if sec and sec > 0 then HUB.gReq[owner] = os.clock() + sec
+  else HUB.gReq[owner] = nil end
+end
+
+function PBX.gTick()
+  local rem = R.HoldG; if not rem then return end
+  local now, any, who = os.clock(), false, nil
+  for k, t in pairs(HUB.gReq) do
+    if now < t then
+      any = true
+      who = who and (who .. "+" .. k) or k
+    else
+      HUB.gReq[k] = nil
+    end
+  end
+  HUB.gWho = who
+  if any ~= HUB.gLastWant then HUB.gTry, HUB.gLastWant = 0, any end
+
+  local srv = sAttr(chr(), "HoldingG") == true
+  if any == srv then
+    if not any then HUB.gOwned = false end
+    HUB.holdG, HUB.gTry = any, 0
+    return
+  end
+  -- НЕ ГАСИМ ЧУЖУЮ СТОЙКУ. Клавиша G у игрока своя, и если атрибут поднят
+  -- без нашего участия, HoldingG=false отберёт у него ввод посреди защиты.
+  if not any and not HUB.gOwned then HUB.holdG = false; return end
+  -- ПАКЕТ МОЖЕТ НЕ ДОЙТИ ИЛИ ПРИЙТИ В ОТКАЗ — ПОВТОРЯЕМ С ЗАМЕДЛЕНИЕМ.
+  -- Сервер поднимает HoldingG не всегда: Debounce, стан, середина броска.
+  -- Жёсткий потолок «четыре попытки и всё» тут не годится: пока причина
+  -- отказа держится, попытки кончатся, а когда она уйдёт, повторять будет уже
+  -- нечему — решение-то не менялось, и стойка не встанет никогда. Поэтому не
+  -- потолок, а замедление: первые четыре раза по 0.2 с, дальше раз в секунду.
+  local gap = ((HUB.gTry or 0) < 4) and 0.20 or 1.00
+  if (now - (HUB.gSentAt or 0)) < gap then return end
+  HUB.gTry, HUB.gSentAt = (HUB.gTry or 0) + 1, now
+  HUB.gSent = (HUB.gSent or 0) + 1
+  HUB.bypass = true
+  pcall(Mt.FireServer, rem, { HoldingG = any })
+  HUB.bypass = false
+  HUB.gOwned, HUB.holdG = any, any
 end
 
 local function tpProxy(pc, cf)
@@ -1971,9 +2064,21 @@ local function scheduleRelease(g, t0, startArgs, isRetry)
   local meterTrace = {}
 
   local tickPeriod = 1/CFG.TickRate
+  -- РЕАЛЬНЫЙ ШАГ ЭТОГО ЦИКЛА, А НЕ 1/60 ПО ВЕРЕ.
+  -- Цикл крутится на Heartbeat:Wait(), и его период равен кадру клиента. По
+  -- этому дампу lastReadAge стабильно 25..30 мс — то есть кадр здесь 25..30
+  -- мс, а не 16.7. См. ниже, зачем это нужно.
+  local loopStep, prevNow = 0, nil
 
   while HUB.running and HUB.gen==g do
     local now = os.clock()
+    if prevNow then
+      local s = now - prevNow
+      if s > 0.001 and s < 0.20 then
+        loopStep = (loopStep > 0) and (loopStep*0.6 + s*0.4) or s
+      end
+    end
+    prevNow = now
     local r, rAt
     if HUB.mSeq ~= seenSeq and HUB.mVal then
       local at = HUB.mAt
@@ -2050,28 +2155,26 @@ local function scheduleRelease(g, t0, startArgs, isRetry)
         end
       end
 
-      -- ПОЧЕМУ «НЕМНОГО НЕ ДОТЯГИВАЕТ ДО ГРИН БАРА».
-      -- Метр в интерфейсе обновляется тиками по 1/60, и мы целились в
-      -- СЕРЕДИНУ того тика, где цель пересекается. Но сервер считает метр не
-      -- по нашим тикам, а от собственного ShotStartTime — то есть непрерывно.
-      -- Значит целиться в середину тика это просто стрелять РАНЬШЕ времени.
-      -- Считаю по этому дампу, бросок MeterIndex 12: точное пересечение цели
-      -- приходилось на lastT + 14.8 мс, снап увёл выстрел на lastT + 8.3 мс.
-      -- Шесть с половиной миллисекунд при скорости 3.08 это 0.020 метра —
-      -- ровно ширина окна Perfect. Такой бросок и получает Good вместо
-      -- Perfect, и таких в журнале четыре из пяти «недотянутых».
-      -- Полностью снап не убираю: округление уже пробовалось в v123 и дало
-      -- регресс. Вместо этого ограничиваю ОПЕРЕЖЕНИЕ долей тика: позже
-      -- пересечения не стреляем никогда, раньше — не больше чем на TickEarly.
-      -- 0.5 это прежнее поведение, 0 — точно по пересечению.
+      -- ПОЧЕМУ «НЕМНОГО НЕ ДОЖИМАЕТ»: ПРИЧИНА ПЕРВАЯ, ПРИЦЕЛ В СЕРЕДИНУ ТИКА.
+      -- Метр приходит тиками по 1/60, и мы целились в СЕРЕДИНУ того тика, где
+      -- пересекается цель. Смысл в этом был бы ровно в одном случае: если
+      -- сервер меряет метр своими дискретными тиками — тогда выстрел на
+      -- границе может попасть в любой из двух, и середина даёт запас.
+      -- Проверка по трассам этого дампа: meterOffset приходит РОВНО каждые
+      -- 1/60 с шагом 0.045 при скорости 2.7, то есть 60 Гц — это частота
+      -- РЕПЛИКАЦИИ. Сам метр сервер считает непрерывно от ShotStartTime и
+      -- ShotSpeed. Значит середина тика ничего не защищает, а только добавляет
+      -- шум: смещение равно (0.5 - дробная часть) тика, то есть от -8.3 до
+      -- +8.3 мс, в единицах метра ±0.022. Замеренное окно Perfect всего
+      -- 1.5151..1.5188 — шум шире окна в шесть раз. По трассе третьего броска
+      -- дампа снап увёл выстрел на 1.5 мс раньше точного пересечения, и это
+      -- дало -0.0045 от цели: мимо окна. Стреляем точно по пересечению,
+      -- CFG.SnapTick возвращает прежнее поведение.
       local raw = lastT + (tgt - lastR)/Rt
       need = raw
-      if tickPeriod and tickPeriod > 0.008 then
+      if CFG.SnapTick and tickPeriod and tickPeriod > 0.008 then
         local k = math.floor((raw - lastT)/tickPeriod)
         local snapped = lastT + (k + 0.5)*tickPeriod
-        -- Позже пересечения середина тика попадает сама, и это ХОРОШО:
-        -- по журналу все броски, ушедшие выше цели, дали Perfect. Режем
-        -- только другую сторону — чрезмерное опережение.
         local lo = raw - tickPeriod * (CFG.TickEarly or 0)
         if snapped < lo then snapped = lo end
         need = snapped
@@ -2084,8 +2187,20 @@ local function scheduleRelease(g, t0, startArgs, isRetry)
         tgtUsed = tgt
         break
       end
+      -- ПРИЧИНА ВТОРАЯ, И ОНА КРУПНЕЕ: ОКНО ОЖИДАНИЯ КОРОЧЕ КАДРА.
+      -- Здесь стояла жёсткая константа 0.020: «если до пересечения меньше 20
+      -- мс — доспиниваемся и стреляем ровно». При кадре 16.7 мс это работало.
+      -- Но кадр у клиента 25..30 мс (в дампе lastReadAge 25.0, 25.0 и 30.4 мс
+      -- на трёх бросках подряд), и тогда бывает так: на этом кадре до цели
+      -- ещё 24 мс — больше окна, ждём; следующий кадр приходит уже ЗА целью,
+      -- и мы уходим веткой phase_late, то есть стреляем позже. Ровно это и
+      -- случилось на двух бросках из трёх: +0.0130 и +0.0140 от цели.
+      -- Правильное условие: спиниваться, если СЛЕДУЮЩАЯ проверка окажется уже
+      -- поздно. Кадр меряем по самому циклу, а не берём на веру.
+      local win = CFG.SpinWindow
+      if loopStep > win then win = math.min(loopStep * 1.15, CFG.SpinMax) end
       if phase >= 0 and phase <= (tgt + CFG.PhaseSane)
-         and (need - now) <= CFG.SpinWindow then
+         and (need - now) <= win then
         while os.clock() < need do end
         firedBy = "phase"
         phaseAtFire = lastR + Rt*(os.clock() - lastT)
@@ -2171,6 +2286,8 @@ local function scheduleRelease(g, t0, startArgs, isRetry)
 
     tickPeriod = tickPeriod,
     tickStep = rate and (rate*tickPeriod) or nil,
+    -- Замеренный кадр этого цикла: по нему видно, хватало ли окна ожидания.
+    loopStep = (loopStep > 0) and (math.floor(loopStep*1e4)/1e4) or nil,
 
     srvMeter = phaseAtFire
                and (phaseAtFire + ((CFG.UseFittedRate and rate) or CFG.RateFlat)
@@ -2673,6 +2790,13 @@ if R.Feed then
     HUB.stats[nm] = (HUB.stats[nm] or 0) + 1
     if HUB.lastShot and not HUB.lastShot.verdict then
       HUB.lastShot.verdict = nm; HUB.lastShot.contest = a[2]
+      -- НОМЕР ПОЛОСЫ, А НЕ ТОЛЬКО ЕЁ НАЗВАНИЕ.
+      -- Лестница у игры своя и НЕСИММЕТРИЧНАЯ: 1..8 это Very Early, Early,
+      -- Slightly Early, Good, Perfect, Slightly Late, Late, Very Late — лишняя
+      -- полоса стоит только с ранней стороны. Значит idx-5 это готовый ЗНАК
+      -- ошибки в полосах: минус рано, плюс поздно. По одному srvMeter знак не
+      -- восстановить (это наша же модель), а по вердикту — восстанавливается.
+      HUB.lastShot.vIdx = idx
       HUB.feedSeq = (HUB.feedSeq or 0) + 1
     end
     HUB.streak = (idx==5) and ((HUB.streak or 0)+1) or 0
@@ -5755,33 +5879,39 @@ end
 track(RunService.Heartbeat:Connect(function(dt)
   local M2 = CFG.Move2
 
-  if not (M2.Enabled and CFG.Grab.Enabled and HUB.running) then
+  -- СТОЙКА У КОЛЬЦА ПРОСТО НЕ ДОХОДИЛА ДО КОДА.
+  -- Она стояла в самом хвосте обработчика, за тремя return-ами: «нет
+  -- угрозы», «слишком далеко, чтобы помочь» и «пришёл, стою». Последний —
+  -- это и есть «мы стоим у кольца», то самое состояние, где стойка нужна
+  -- больше всего, и ровно в нём до неё не доходило ни разу. Плюс сам ключ
+  -- Move2.Stance лежал в false без единого элемента интерфейса, то есть
+  -- включить её было нельзя вообще.
+  local function stanceAtSpot(on)
+    on = on and M2.Stance and true or false
+    HUB.autoStance = on
+    PBX.wantG("automove", on and 0.30 or nil)
+  end
 
-    if HUB.autoStance and R.HoldG then
-      HUB.autoStance = false
-      HUB.bypass = true
-      pcall(Mt.FireServer, R.HoldG, { HoldingG = false })
-      HUB.bypass = false
-    end
+  -- Все выходы Auto Move раньше сами слали HoldingG=false. Теперь просто
+  -- снимаем СВОЮ просьбу: если стойку в этот же кадр держит защита или сам
+  -- игрок, она останется стоять.
+  if not (M2.Enabled and CFG.Grab.Enabled and HUB.running) then
+    HUB.autoStance = false; PBX.wantG("automove", nil)
     stopSteer("automove"); HUB.autoHeld = false; return
   end
   if CFG.Grab.OnlyInMatch and not PBX.inMatch() then
-
-    if HUB.autoStance and R.HoldG then
-      HUB.autoStance = false
-      HUB.bypass = true
-      pcall(Mt.FireServer, R.HoldG, { HoldingG = false })
-      HUB.bypass = false
-    end
+    HUB.autoStance = false; PBX.wantG("automove", nil)
     HUB.autoWhy = "not in a match"; stopSteer("automove"); HUB.autoHeld = false; return
   end
   if PBX.ballIsOurs() then
-    HUB.autoWhy = "the ball is ours"; stopSteer("automove"); return
+    HUB.autoWhy = "the ball is ours"; stanceAtSpot(false)
+    stopSteer("automove"); return
   end
   if CFG.Grab.SkipDead then
     local dead, why = PBX.ballDead()
     if dead then
       HUB.autoWhy = "dead ball: " .. tostring(why)
+      stanceAtSpot(false)
       stopSteerSoft("automove"); return
     end
   end
@@ -5843,10 +5973,12 @@ track(RunService.Heartbeat:Connect(function(dt)
   end
 
   local threat = (carrier ~= nil) or (ballPt ~= nil)
+  local atRim = false
   if not spot then
     if not threat then
       HUB.autoWhy = "no threat, you have control"
       HUB.autoHeld = false
+      stanceAtSpot(false)
       stopSteerSoft("automove")
       return
     end
@@ -5855,13 +5987,28 @@ track(RunService.Heartbeat:Connect(function(dt)
 
     if M2.MaxRun > 0 and runTime(rim) > M2.MaxRun then
       HUB.autoWhy = ("too far to help (%.2fs), you have control"):format(runTime(rim))
+      stanceAtSpot(false)
       stopSteerSoft("automove")
       return
     end
     spot = rim
+    atRim = true
     why = (why and (why .. " -> rim")) or "holding the rim"
   end
   HUB.autoWhy = why
+
+  -- ОДНО РЕШЕНИЕ ПРО СТОЙКУ НА ВЕСЬ ОБРАБОТЧИК, И ПРИНИМАЕТСЯ ОНО ДО
+  -- ВСЕХ ВЫХОДОВ. Стоим на месте — держим: у Guard приставной шаг стоит
+  -- 0.95..1.05 от полной скорости, а у Base то же движение назад падает
+  -- вдвое, и под щитом мы двигаемся именно вбок. Бежим — не держим: у
+  -- Guard есть штраф за резкую смену курса, а на длинном забеге курс
+  -- правится каждый кадр.
+  local carrierNear = false
+  do
+    local cp = carrier and posOf(sChild(carrier, "HumanoidRootPart"))
+    if cp then carrierNear = ((cp - me) * FLAT).Magnitude <= M2.StanceRad end
+  end
+  local standStance = ((not atRim) or M2.RimStance) or carrierNear
 
   local d = ((spot - me) * FLAT).Magnitude
   if HUB.autoHeld then
@@ -5869,6 +6016,7 @@ track(RunService.Heartbeat:Connect(function(dt)
                   and ((spot - HUB.autoSpot) * FLAT).Magnitude or 1e9
     if d < M2.HoldTol and moved < M2.HoldTol then
       HUB.autoWhy = (why or "holding") .. " (holding)"
+      stanceAtSpot(standStance)
       stopSteerSoft("automove")
       return
     end
@@ -5876,8 +6024,10 @@ track(RunService.Heartbeat:Connect(function(dt)
   end
   if d < 1.5 then
     HUB.autoHeld, HUB.autoSpot = true, spot
+    stanceAtSpot(standStance)
     stopSteerSoft("automove")
   else
+    stanceAtSpot(carrierNear)
     local dir = ((spot - me) * FLAT).Unit
     -- СПРИНТ ДЕРЖИМ ПОЧТИ ДО САМОЙ ТОЧКИ.
     -- Порог стоял на шести студах, и последний отрезок мы шли шагом: при
@@ -5890,16 +6040,6 @@ track(RunService.Heartbeat:Connect(function(dt)
     local cp = posOf(sChild(carrier, "HumanoidRootPart"))
     local near = cp and ((cp - me) * FLAT).Magnitude or 1e9
 
-    if R.HoldG then
-      local stanceOn = M2.Stance and CFG.Defense.Enabled
-      local want = stanceOn and (near <= M2.StanceRad) or false
-      if want ~= (HUB.autoStance == true) then
-        HUB.autoStance = want
-        HUB.bypass = true
-        pcall(Mt.FireServer, R.HoldG, { HoldingG = want })
-        HUB.bypass = false
-      end
-    end
     if M2.Steal and CFG.Defense.Enabled and R.Steal and near <= M2.StealRad
        and os.clock() - (HUB.g2Steal or 0) >= M2.StealCD then
       HUB.g2Steal = os.clock()
@@ -5915,13 +6055,6 @@ track(RunService.Heartbeat:Connect(function(dt)
         tgt = (ballTrueNow(BALL.pos, BALL.vel, BALL.stale)) or BALL.pos
       end
       if tgt then faceBall(tgt, dt, CFG.Face.Rate, CFG.Face.Smooth) end
-    end
-  elseif HUB.autoStance then
-    HUB.autoStance = false
-    if R.HoldG then
-      HUB.bypass = true
-      pcall(Mt.FireServer, R.HoldG, { HoldingG = false })
-      HUB.bypass = false
     end
   end
 end))
@@ -6670,68 +6803,107 @@ local function findMovement()
 end
 
 -- ЕГО УЖЕ ДЕРЖИТ ТИММЕЙТ.
--- Возвращает того самого напарника и словами, чем он занят. Считаем прикрытым
--- только если напарник НЕ ДАЛЬШЕ нас: если мы ближе, основной защитник всё-
--- таки мы, и отдавать соперника было бы хуже, чем взять вдвоём.
-function PBX.coveredByMate(cp, hp)
+-- Возвращает напарника, словами чем он занят, и третьим — АКТИВНО ли
+-- противодействие (для накрытия данка стоящего рядом напарника мало).
+--
+-- ЧТО ЗДЕСЬ БЫЛО НЕ ТАК.
+-- Признаком «прикрыт» считалось в том числе «просто стоит на линии к нашему
+-- кольцу». Это не защита: игрок может стоять там спиной, ловить пас, идти
+-- мимо. Соперник при этом свободен, а мы на него не идём — и получается
+-- худшее из двух, никто никого не держит.
+-- Второе и более тонкое: стойка это СОСТОЯНИЕ ИГРОКА, а не привязка к
+-- сопернику. Напарник в пятнадцати студах (а радиус у пользователя выкручен
+-- в 15.5) вполне может держать стойку на СВОЁМ подопечном, и мы засчитывали
+-- её носителю. Теперь два условия вместо одного: он реально защищается И
+-- защищается именно на нём — этот соперник для него ближайший.
+function PBX.coveredByMate(cp)
   local D = CFG.Defense
   if not (D.SkipCovered and cp) then return nil end
   local rad = D.CoveredRad
-  -- УСЛОВИЕ «ТИММЕЙТ НЕ ДАЛЬШЕ НАС» УБРАНО, И ЭТО БЫЛА МОЯ ОШИБКА.
-  -- Я добавил его от себя. По журналу мы стоим от носителя в 3..5 студах —
-  -- значит напарнику надо было оказаться ещё ближе И при этом держать
-  -- стойку. За всю сессию условие сошлось 357 раз при десятках тысяч тиков,
-  -- то есть функция почти не работала. Радиус и есть всё правило.
-  local u = nil
-  if hp then
-    local v = (hp - cp) * FLAT
-    if v.Magnitude > 0.5 then u = v.Unit end
+  local slack = D.CoveredOwn or 0
+
+  -- ОН ДЕРЖИТ ЗАЩИТУ, НО НА КОМ?
+  -- Если к напарнику ощутимо ближе другой соперник, стойка адресована тому.
+  -- Позиции соперников собираем ОДИН раз и только если дошло до проверки:
+  -- иначе это вложенный обход списка персонажей на каждого напарника, а
+  -- список в парке доходит до тридцати с лишним моделей.
+  local foes = nil
+  local function onThisMan(mp, d0)
+    if not foes then
+      foes = {}
+      for _, e in ipairs(charsList()) do
+        if isEnemy(e) then
+          local ep = posOf(sChild(e, "HumanoidRootPart"))
+          if ep then foes[#foes+1] = ep end
+        end
+      end
+    end
+    for _, ep in ipairs(foes) do
+      if ((ep - mp) * FLAT).Magnitude < (d0 - slack) then return false end
+    end
+    return true
   end
+
+  local best, bestWhy, bestD, bestHi
   for _, c in ipairs(charsList()) do
     if isMate(c) then
       local p = posOf(sChild(c, "HumanoidRootPart"))
       if p then
-        local rel = (p - cp) * FLAT
-        if rel.Magnitude <= rad then
-          if sAttr(c, "HoldingG") == true then return c, "in stance", true end
+        local d = ((p - cp) * FLAT).Magnitude
+        if d <= rad and ((not bestD) or d < bestD) then
+          -- ЧЕТЫРЕ ПРИЗНАКА ЖИВОЙ ЗАЩИТЫ, ВСЕ ЧИТАЮТСЯ С ЕГО ПЕРСОНАЖА.
+          -- Блок и прыжок отмечаем отдельно: только они годятся против
+          -- данка, где нужен реально накрывающий напарник, а не стоящий.
+          local why, hi = nil, false
           local a = sAttr(c, "Action")
-          if a == "Blocking" then return c, "blocking", true end
-          if a == "Stealing" then return c, "going for the steal", true end
-          if sAttr(c, "InAir") == true then return c, "in the air on him", true end
-          -- И ПРОСТО СТОЯТЬ НА ЛИНИИ — ЭТО ТОЖЕ ЗАЩИТА.
-          -- Стойку живой игрок держит редко, а закрывать проход телом —
-          -- постоянно. Если напарник между носителем и нашим кольцом и не
-          -- сильно в стороне от прямой, соперник уже занят.
-          if u then
-            local along = rel:Dot(u)
-            if along > 0 then
-              local lat = (rel - u * along).Magnitude
-              if lat <= D.CoveredLane then
-                -- Третьим значением — АКТИВНО ли он противодействует. Просто
-                -- стоять на линии это тоже защита, но для накрытия данка
-                -- этого мало: там нужен реально прыгающий напарник.
-                return c, ("on the line, %.1f in front"):format(along), false
-              end
-            end
+          if a == "Blocking" then why, hi = "blocking", true
+          elseif sAttr(c, "InAir") == true then why, hi = "in the air on him", true
+          elseif sAttr(c, "HoldingG") == true then why = "in stance"
+          elseif a == "Stealing" then why = "going for the steal" end
+          if why and onThisMan(p, d) then
+            best, bestWhy, bestD, bestHi = c, ("%s at %.1f"):format(why, d), d, hi
           end
         end
       end
     end
   end
+  if best then return best, bestWhy, bestHi end
   return nil
 end
 
--- РЕШЕНИЕ ДОЛЖНО ЛИПНУТЬ, ИНАЧЕ ПОЛУЧАЕТСЯ ДЁРГАНЬЕ.
--- Напарник шевелится: кадр он в стойке или на линии, следующий уже нет.
--- В журнале это видно построчно — три кадра "target FUNNYBOYRICH123", два
--- кадра "leaving him to the mate", снова "target". Мы стартуем, тормозим,
--- снова стартуем и никуда не приходим, попутно заваливая канал пакетами
--- Move. Снаружи это читается ровно как «всё равно идёт на прикрытого».
+-- РЕШЕНИЕ ДОЛЖНО ЛИПНУТЬ, ИНАЧЕ ПОЛУЧАЕТСЯ ДЁРГАНЬЕ. ЭТО НЕ ЗАДЕРЖКА.
+-- Держится не действие, а ВЫВОД «его ведёт напарник». Реагируем мы по-
+-- прежнему в тот же кадр — просто не пересматриваем вывод каждые 16 мс.
+-- Напарник шевелится: кадр он в стойке, следующий уже нет. В журнале это
+-- видно построчно — три кадра "target FUNNYBOYRICH123", два кадра "leaving
+-- him to the mate", снова "target". Мы стартуем, тормозим, снова стартуем и
+-- никуда не приходим, попутно заваливая канал пакетами Move. Снаружи это
+-- читается ровно как «всё равно идёт на прикрытого».
 -- Приняли решение — держим его CoveredHold секунд, пока напарник жив.
 PBX.covHold = weakKeys({})
-function PBX.coveredSticky(who, cp, hp)
-  local mate, why, active = PBX.coveredByMate(cp, hp)
-  local H, now = PBX.covHold, os.clock()
+PBX.covMemo = weakKeys({})
+function PBX.coveredSticky(who, cp)
+  -- ОДИН РАСЧЁТ НА КАДР НА ЧЕЛОВЕКА.
+  -- За один и тот же кадр это спрашивают Auto Defense, Auto Move, Auto
+  -- Intercept и Contest Shooter — про одного и того же носителя. Раньше это
+  -- был один обход списка, теперь ещё и проверка «на ком он», и повторять её
+  -- четыре раза подряд ради одинакового ответа незачем.
+  -- Кэшируется ТОЛЬКО сырой ответ «кто его держит прямо сейчас». Липкость
+  -- ниже обязана отработать в любом случае, иначе пустой ответ из кэша
+  -- вернётся мимо неё и удержание перестанет существовать.
+  local now = os.clock()
+  local mate, why, active
+  local m = who and PBX.covMemo[who]
+  if m and (now - m.at) < 0.03 then
+    mate, why, active = m.mate, m.why, m.active
+  else
+    mate, why, active = PBX.coveredByMate(cp)
+    if who then
+      if not m then m = {}; PBX.covMemo[who] = m end
+      m.at, m.mate, m.why, m.active = now, mate, why, active
+    end
+  end
+  local H = PBX.covHold
   if mate then
     local e = H[who]
     if not e then e = {}; H[who] = e end
@@ -6750,15 +6922,26 @@ end
 -- Таких систем ТРИ: Auto Defense, Auto Move и Auto Intercept, плюс Contest
 -- Shooter телепортом. Проверка «его уже держит напарник» стояла только в
 -- первой. Отсюда «меня всё равно ведёт на прикрытого»: вёл не AutoDefend.
--- activeOnly — считать прикрытым лишь при ЖИВОМ противодействии (стойка,
--- блок, прыжок). Нужно для данка: там стоящий рядом напарник ничего не
--- решает, и накрыть вдвоём лучше, чем не накрыть вовсе.
+-- activeOnly — считать прикрытым лишь при НАКРЫТИИ (блок или прыжок на нём).
+-- Нужно для данка: стоящий рядом в стойке напарник данк не снимает, а
+-- накрыть вдвоём лучше, чем не накрыть вовсе.
 function PBX.leaveToMate(enemy, cp, activeOnly)
   if not (CFG.Defense.SkipCovered and enemy and cp) then return nil end
-  local mate, why, active = PBX.coveredSticky(enemy, cp, hoopWeDefend())
+  local mate, why, active = PBX.coveredSticky(enemy, cp)
   if not mate then return nil end
   if activeOnly and not active then return nil end
-  HUB.leftToMate = (HUB.leftToMate or 0) + 1
+  -- СЧИТАЕМ ЭПИЗОДЫ, А НЕ КАДРЫ.
+  -- В прошлом дампе стояло «left to a mate 3495 times» — это был счётчик
+  -- кадров при 60 Гц, то есть «примерно минуту». Как число решений оно
+  -- бессмысленно. Новый эпизод начинается, когда мы уступили ДРУГОГО
+  -- соперника или после перерыва больше полусекунды.
+  local L = HUB.leftLast
+  if (not L) or L.who ~= enemy or (os.clock() - (L.at or 0)) > 0.5 then
+    HUB.leftToMate = (HUB.leftToMate or 0) + 1
+    HUB.leftLast = { who = enemy, at = os.clock() }
+  else
+    L.at = os.clock()
+  end
   return mate, why
 end
 
@@ -6832,17 +7015,12 @@ end
 track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
   if not HUB.running then return end
 
-  local function releaseG()
-    if HUB.holdG then
-      HUB.bypass = true
-      pcall(Mt.FireServer, InputSvc:FindFirstChild("HoldG"), { HoldingG = false })
-      HUB.bypass = false
-      HUB.holdG = false
-    end
-  end
-
-  local function defOff()
-    releaseG()
+  -- keepG = оставить стойку стоять, просто перестать вести. Нужно ровно для
+  -- одного случая: соперника взял напарник. Мы никуда не идём, но остаёмся
+  -- в защите — если он проскочит мимо напарника, реагировать надо сразу, а
+  -- поднимать стойку заново это ещё один пакет и ещё один кадр.
+  local function defOff(keepG)
+    if not keepG then PBX.wantG("defense", nil) end
     stopSteer("defense")
     HUB.defActive = false
     HUB.defSpeed, HUB.defSpeedUntil = nil, nil
@@ -6871,7 +7049,9 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
         else
           local d = ((cp-me)*FLAT).Magnitude
           if d <= CFG.Defense.Engage then
-            local mate, doing = PBX.coveredSticky(c, cp, hoopWeDefend())
+            -- Через общее правило, а не мимо него: тогда и счётчик эпизодов
+            -- один на все системы, и поведение здесь ровно такое же.
+            local mate, doing = PBX.leaveToMate(c, cp)
             if mate then
               covered += 1
               coveredWhy = ("%s already has %s (%s)")
@@ -6889,9 +7069,18 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
       :format(CFG.Defense.HoopRad))
   end
   if not target then
-    defOff()
+    -- СТОЙКУ ПРИ УСТУПКЕ НАПАРНИКУ НЕ СНИМАЕМ.
+    -- Раньше выход был один на все причины и всегда гасил стойку. Значит на
+    -- каждом кадре, где соперника держит напарник, мы ВЫХОДИЛИ ИЗ ЗАЩИТЫ —
+    -- стояли столбом в обычной стойке. Идти на него не надо, а быть готовым
+    -- надо: он в радиусе Engage, и если пройдёт напарника, до нас останется
+    -- пара студов.
+    local keepG = (covered > 0) and CFG.Defense.HoldG
+    if keepG then PBX.wantG("defense", 0.30) end
+    defOff(keepG)
     if covered > 0 then
       HUB.defWhy = "leaving him to the mate: " .. tostring(coveredWhy)
+                   .. (keepG and ", stance stays up" or "")
       HUB.defCovered = (HUB.defCovered or 0) + 1
       dbg("defense", HUB.defWhy)
     else
@@ -6900,12 +7089,7 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
     return
   end
 
-  if CFG.Defense.HoldG and not HUB.holdG then
-    HUB.bypass = true
-    pcall(Mt.FireServer, InputSvc:FindFirstChild("HoldG"), { HoldingG = true })
-    HUB.bypass = false
-    HUB.holdG = true
-  end
+  if CFG.Defense.HoldG then PBX.wantG("defense", 0.30) end
 
   local m = findMovement()
   if m and rawget(m, "AutoGuard") == true then pcall(function() m.AutoGuard = false end) end
@@ -7039,12 +7223,11 @@ local function blatantRelease()
   -- Раньше выход из подмены позиции гасил и стойку, поэтому она жила ровно
   -- HoldTime = 0.12 с. Контест за это время не набирается. Теперь за стойку
   -- отвечает BL.gUntil, а снимает её отдельный присмотр ниже.
-  if BL.heldG and R.HoldG and not (BL.gUntil and os.clock() < BL.gUntil) then
-    BL.heldG = false
-    BL.gUntil = nil
-    HUB.bypass = true
-    pcall(Mt.FireServer, R.HoldG, { HoldingG = false })
-    HUB.bypass = false
+  -- Снимаем ТОЛЬКО свою просьбу: раньше это был прямой HoldingG=false, и он
+  -- сбивал стойку, которую в тот же момент держала защита.
+  if BL.heldG and not (BL.gUntil and os.clock() < BL.gUntil) then
+    BL.heldG, BL.gUntil = false, nil
+    PBX.wantG("contest", nil)
   end
   if BL.state ~= "hold" then BL.state = "idle"; HUB.blatantHolding = false; return end
   holdRelease()
@@ -7107,11 +7290,9 @@ local function contestEngage(c, why, provisional)
       BL.jumpUntil = os.clock() + CFG.Blatant.JumpWindow
       -- Стойку снимаем сразу: под кольцом она уже ничего не даёт, а держать
       -- G и прыгать одновременно смысла нет.
-      if BL.heldG and R.HoldG then
+      if BL.heldG then
         BL.heldG = false
-        HUB.bypass = true
-        pcall(Mt.FireServer, R.HoldG, { HoldingG = false })
-        HUB.bypass = false
+        PBX.wantG("contest", nil)
       end
     end
     if not provisional then
@@ -7231,27 +7412,19 @@ track(RunService.Heartbeat:Connect(function()
   end
   if not BL.gUntil then return end
   if os.clock() < BL.gUntil then
-    if R.HoldG and sAttr(chr(), "HoldingG") ~= true
-       and os.clock() - (BL.gAt or 0) > 0.12 then
-      BL.gAt = os.clock()
-      BL.gSent = (BL.gSent or 0) + 1
-      -- Отметку об удержании ставим И ЗДЕСЬ. Раньше её ставил только тик
-      -- подмены позиции, а он живёт HoldTime = 0.12 с: если стойку дожимал
-      -- один этот присмотр, heldG оставался false, и по истечении времени
-      -- ветка снятия ниже не срабатывала — G оставалась зажатой навсегда.
-      BL.heldG = true
-      HUB.bypass = true
-      pcall(Mt.FireServer, R.HoldG, { HoldingG = true })
-      HUB.bypass = false
-    end
+    -- Повторную отправку и сверку с атрибутом теперь ведёт общий арбитр,
+    -- здесь достаточно продлевать просьбу. Отметку об удержании ставим и
+    -- тут: раньше её ставил только тик подмены позиции, а он живёт
+    -- HoldTime = 0.12 с — если стойку дожимал один этот присмотр, heldG
+    -- оставался false, и по истечении времени ветка снятия не срабатывала.
+    BL.heldG = true
+    PBX.wantG("contest", (BL.gUntil - os.clock()) + 0.05)
     return
   end
   BL.gUntil = nil
-  if BL.heldG and R.HoldG then
+  if BL.heldG then
     BL.heldG = false
-    HUB.bypass = true
-    pcall(Mt.FireServer, R.HoldG, { HoldingG = false })
-    HUB.bypass = false
+    PBX.wantG("contest", nil)
   end
 end))
 
@@ -7341,16 +7514,10 @@ track(RunService.Heartbeat:Connect(function(dt)
         return
       end
     end
-    -- СТОЙКА ДЕРЖИТСЯ ДО ПОДТВЕРЖДЕНИЯ СЕРВЕРОМ.
-    if BL.wantG and R.HoldG and sAttr(chr(), "HoldingG") ~= true then
-      if os.clock() - (BL.gAt or 0) > 0.12 then
-        BL.gAt = os.clock()
-        BL.gSent = (BL.gSent or 0) + 1
-        BL.heldG = true
-        HUB.bypass = true
-        pcall(Mt.FireServer, R.HoldG, { HoldingG = true })
-        HUB.bypass = false
-      end
+    -- СТОЙКА ДЕРЖИТСЯ ДО ПОДТВЕРЖДЕНИЯ СЕРВЕРОМ — этим занят общий арбитр.
+    if BL.wantG then
+      BL.heldG = true
+      PBX.wantG("contest", 0.20)
     end
     -- ПРЫЖОК ОТДАН ПРИСМОТРУ ВЫШЕ: он переотправляет, пока сервер не ответит.
 
@@ -7476,6 +7643,19 @@ track(RunService.Heartbeat:Connect(function()
   pcall(function() c:SetAttribute("Stamina", CFG.Stamina.Value) end)
 end))
 
+-- АРБИТР СТОЙКИ ТИКАЕТ ПОСЛЕДНИМ, УЖЕ ПОСЛЕ ВСЕХ, КТО ЕЁ ПРОСИТ.
+-- Порядок обработчиков Heartbeat — это порядок подключения, поэтому решение
+-- принимается В ТОМ ЖЕ КАДРЕ, что и просьбы Auto Move, Auto Defense и
+-- Contest Shooter, а не с задержкой в кадр.
+track(RunService.Heartbeat:Connect(function()
+  if not HUB.running then
+    if next(HUB.gReq) ~= nil then HUB.gReq = {} end
+    if HUB.gOwned then PBX.gTick() end
+    return
+  end
+  PBX.gTick()
+end))
+
 local function unstick()
   local pc = proxyPart()
 
@@ -7487,6 +7667,8 @@ local function unstick()
   BL.provisional, BL.heldFrom, BL.since, BL.heldG = false, nil, nil, false
   BL.jumpUntil, BL.gUntil, BL.wantJump, BL.wantG = nil, nil, false, false
   BL.backCF, BL.backUntil, BL.backAt = nil, nil, nil
+  -- Кнопка паники снимает ВСЕ просьбы о стойке, чей бы владелец ни был.
+  HUB.gReq = {}
   if pc then pcall(function() pc.Anchored = false end) end
 
   if BL.realCF then tpProxy(pc, BL.realCF)
@@ -7719,6 +7901,9 @@ local function save()
       return (ok and typeof(v)=="Vector3") and (math.floor(v.Magnitude*100)/100) or nil
     end)(),
     holdG = HUB.holdG, defenseActive = HUB.defActive,
+    srvHoldG = sAttr(chr(), "HoldingG"), gWho = HUB.gWho,
+    gSent = HUB.gSent or 0, gOwned = HUB.gOwned,
+    defHoldG = CFG.Defense.HoldG, m2RimStance = CFG.Move2.RimStance,
 
     autoStance = HUB.autoStance, autoHeld = HUB.autoHeld,
     m2Stance = CFG.Move2.Stance, m2Steal = CFG.Move2.Steal,
@@ -7824,7 +8009,7 @@ local function save()
     local t = {}
     for k, n in pairs(HUB.steerN or {}) do t[#t+1] = ("%s x%d"):format(k, n) end
     table.sort(t)
-    rep(("[PB] who steered you: %s | right now: %s | left to a mate %d times")
+    rep(("[PB] who steered you: %s | right now: %s | men left to a mate: %d")
       :format(#t > 0 and table.concat(t, " | ") or "nobody",
               tostring(HUB.moveOwner or "you"), HUB.leftToMate or 0))
   end
@@ -7843,18 +8028,69 @@ local function save()
             CFG.UseFittedRate and "fitted" or "constant"))
 
   do
+    -- ОКНО PERFECT БЫЛО ВЗЯТО ИЗ СТАРОГО ЗАМЕРА И ВРАЛО.
+    -- Здесь стояло 1.504..1.577, а откалиброванное окно (53 броска, три
+    -- выборки) — 1.5151..1.5188, оно же записано у CFG.Target. Из-за старой,
+    -- вчетверо более широкой рамки отчёт писал «inside Perfect 3/3» на
+    -- сессии, где Perfect не было НИ ОДНОГО. Считаю по той же величине, по
+    -- которой цель и калибровалась.
     local n, sum, lo, hi, inw = 0, 0, nil, nil, 0
+    local pw = 0.0019   -- половина замеренного окна: (1.5188-1.5151)/2
     for _, sh in ipairs(HUB.shots) do
       if type(sh.srvMeter) == "number" then
         n += 1; sum += sh.srvMeter
         if not lo or sh.srvMeter < lo then lo = sh.srvMeter end
         if not hi or sh.srvMeter > hi then hi = sh.srvMeter end
-        if sh.srvMeter >= 1.504 and sh.srvMeter <= 1.577 then inw += 1 end
+        if math.abs(sh.srvMeter - CFG.Target) <= pw then inw += 1 end
       end
     end
     if n > 0 then
-      rep(("[PB] server meter: avg %.3f, range %.3f..%.3f | inside Perfect %d/%d (target %.3f)")
-        :format(sum/n, lo, hi, inw, n, CFG.Target))
+      rep(("[PB] server meter: avg %.3f, range %.3f..%.3f | inside Perfect %d/%d (target %.3f +-%.4f)")
+        :format(sum/n, lo, hi, inw, n, CFG.Target, pw))
+      -- КУДА МЫ МАЖЕМ ПО ВРЕМЕНИ — ПО ВЕРДИКТУ, А НЕ ПО СВОЕЙ ЖЕ МОДЕЛИ.
+      -- srvMeter это наш расчёт, и сверять модель с моделью бессмысленно.
+      -- Вердикт же приходит от сервера номером полосы, а лестница у игры
+      -- несимметричная: 5 это Perfect, меньше — рано, больше — поздно.
+      -- Средний номер сразу говорит, надо ДОЖИМАТЬ или отпускать раньше, а
+      -- средний промах по цели в тех же строках показывает, виноват ли в
+      -- этом сам прицел или разброс исполнения.
+      do
+        local vn, vs, en, es, ea = 0, 0, 0, 0, 0
+        for _, sh in ipairs(HUB.shots) do
+          if type(sh.vIdx) == "number" then vn += 1; vs += (sh.vIdx - 5) end
+          if type(sh.phase) == "number" and type(sh.target) == "number" then
+            local e = sh.phase - sh.target
+            en += 1; es += e; ea += math.abs(e)
+          end
+        end
+        if vn > 0 or en > 0 then
+          local band = (vn > 0) and (vs/vn) or 0
+          rep(("[PB] release: %s | bands %+.2f (n=%d, minus is early) | aim %+.4f, spread %.4f (n=%d) | snap=%s")
+            :format(vn == 0 and "no verdicts yet"
+                    or (band < -0.15 and "hold LONGER"
+                        or (band > 0.15 and "let go EARLIER" or "centred")),
+                    band, vn,
+                    (en > 0) and (es/en) or 0, (en > 0) and (ea/en) or 0, en,
+                    tostring(CFG.SnapTick)))
+        end
+        -- КАДР КЛИЕНТА И СКОЛЬКО БРОСКОВ УШЛО ПОЗЖЕ ЦЕЛИ ПРОСТО ПОТОМУ, ЧТО
+        -- СЛЕДУЮЩАЯ ПРОВЕРКА ПРИШЛА СЛИШКОМ ПОЗДНО.
+        do
+          local ln, ls2, lmax, late = 0, 0, 0, 0
+          for _, sh in ipairs(HUB.shots) do
+            if type(sh.loopStep) == "number" then
+              ln += 1; ls2 += sh.loopStep
+              if sh.loopStep > lmax then lmax = sh.loopStep end
+            end
+            if sh.firedBy == "phase_late" then late += 1 end
+          end
+          if ln > 0 then
+            rep(("[PB] release loop: frame %.1f ms avg, %.1f ms worst (n=%d) | wait window %.0f..%.0f ms | overshot the target %d times")
+              :format((ls2/ln)*1000, lmax*1000, ln,
+                      CFG.SpinWindow*1000, CFG.SpinMax*1000, late))
+          end
+        end
+      end
       -- ГДЕ ЛЕЖИТ PERFECT НА САМОМ ДЕЛЕ, А ГДЕ МЫ.
       -- Вердикт решает сервер, и по одному srvMeter его не предсказать: зоны
       -- Perfect и Good пересекаются. Зато видно СИСТЕМАТИЧЕСКИЙ сдвиг: если
@@ -7974,9 +8210,14 @@ local function save()
             meta.jumpApex and ("%.1f measured x%d"):format(meta.jumpApex, meta.jumpApexN or 0)
               or "not measured yet (estimate)",
             JP.armReach(), tostring(meta.inMatch), tostring(meta.onlyInMatch)))
-  rep(("[PB] stance: Auto Defense holdG=%s | Auto Move stance=%s (enabled %s, steal %s)")
-    :format(tostring(meta.holdG), tostring(meta.autoStance),
-            tostring(meta.m2Stance), tostring(meta.m2Steal)))
+  rep(("[PB] stance: we want %s, server says %s | asked by: %s | packets %d | ours=%s")
+    :format(tostring(meta.holdG), tostring(meta.srvHoldG),
+            tostring(meta.gWho or "nobody"), meta.gSent or 0,
+            tostring(meta.gOwned)))
+  rep(("[PB] stance sources: defense=%s | auto move=%s (at the rim %s, near a man %s) | steal %s")
+    :format(tostring(meta.defHoldG), tostring(meta.m2Stance),
+            tostring(meta.m2RimStance), tostring(meta.autoStance),
+            tostring(meta.m2Steal)))
   rep(("[PB] prediction error at %.2fs ahead: avg=%.2f max=%.2f stds (n=%d)")
     :format(meta.predCheckAt or 0,
             meta.predFitAvg or -1, meta.predFitMax or -1, meta.predFitN))
@@ -9194,22 +9435,23 @@ return function(_Lib, _Core)
         Min = 0.05, Max = 1, Precision = 2,
         Callback = function(v) CFG.Face.Smooth = v end })
       bool(s1, "Leave Covered Men",
-        "any feature that walks you at a man obeys this, not just this one",
+        "the mate must actually be defending him: stance, block, steal or in the air",
         function() return CFG.Defense.SkipCovered end,
         function(v) CFG.Defense.SkipCovered = v end, "DEF_SkipCovered")
       slider(s1, { Name = "Counts As Covered", Flag = "DEF_CoveredRad",
         Default = CFG.Defense.CoveredRad, Min = 4, Max = 25, Precision = 1,
         Callback = function(v) CFG.Defense.CoveredRad = v end,
         Desc = "how close the mate has to be to the attacker to count as guarding him" })
-      slider(s1, { Name = "Covered Lane", Flag = "DEF_CoveredLane",
-        Default = CFG.Defense.CoveredLane, Min = 0, Max = 10, Precision = 1,
-        Callback = function(v) CFG.Defense.CoveredLane = v end,
-        Desc = "a mate standing this near the line to your hoop counts even without a stance" })
+      slider(s1, { Name = "Guarding Someone Else", Flag = "DEF_CoveredOwn",
+        Default = CFG.Defense.CoveredOwn, Min = 0, Max = 8, Precision = 1,
+        Callback = function(v) CFG.Defense.CoveredOwn = v end,
+        Desc = "another attacker this much closer to the mate means the stance is for that one" })
       slider(s1, { Name = "Walk Around Him", Flag = "DEF_Around", Default = CFG.Defense.WalkAround,
         Min = 0, Max = 8, Precision = 1,
         Callback = function(v) CFG.Defense.WalkAround = v end,
         Desc = "the guard spot sits behind him, 0 walks straight into his body" })
-      bool(s1, "Defensive Stance", "hold G while guarding",
+      bool(s1, "Defensive Stance",
+        "held while guarding and kept up when you leave a man to a mate",
         function() return CFG.Defense.HoldG end,
         function(v) CFG.Defense.HoldG = v end)
       slider(s1, { Name = "Hoop Radius", Flag = "DEF_HoopRad", Default = CFG.Defense.HoopRad,
@@ -9320,6 +9562,14 @@ return function(_Lib, _Core)
           CFG.Move2.Enabled = v
           if v then moveEngineOn() else stopSteer("automove") end
         end, "M2_Enabled")
+      bool(s3, "Stance When Parked",
+        "hold G once you are standing on the spot, sideways steps are twice as fast in it",
+        function() return CFG.Move2.Stance end,
+        function(v) CFG.Move2.Stance = v end, "M2_Stance")
+      bool(s3, "Stance At The Rim",
+        "same while covering the rim, the game turns that into a box-out",
+        function() return CFG.Move2.RimStance end,
+        function(v) CFG.Move2.RimStance = v end, "M2_RimStance")
 
       local grabPara = s3:Paragraph({ Header = "Timing", Body = "waiting for a jump" })
       task.spawn(function()
