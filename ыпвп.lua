@@ -20,7 +20,7 @@ do
   end
 end
 
-local VERSION = 157
+local VERSION = 158
 
 local CFG = {
 
@@ -33,6 +33,29 @@ local CFG = {
   -- В v123 это значение уже стояло, но ВМЕСТЕ с заменой floor на округление
   -- при выборе тика — регрессию дал тик, и откат унёс заодно и цель.
   Target    = 1.5170,
+  -- ДОБАВКА К ЦЕЛИ. «ДОЖАТЬ» ТЕПЕРЬ МОЖНО ИЗМЕРИТЬ, А НЕ УГАДЫВАТЬ.
+  -- После v157 прицел стал точным: в дампе 26 бросков подряд ушли на
+  -- srvMeter = 1.51700 РОВНО, средняя ошибка +0.000007, разброс 0.0000, ни
+  -- одного проскока. То есть по таймингу выжато всё, и остаток — это уже
+  -- смещение самой цели. Данных на него теперь хватает:
+  --   * вердиктов 27: Perfect 10, Good 16, Early 1, «поздних» НОЛЬ. Будь мы
+  --     в центре, промахи легли бы на обе стороны;
+  --   * лестница игры несимметрична, и порядок её подтверждён этим же дампом
+  --     напрямую: единственный бросок, ушедший на 0.21 НИЖЕ цели, получил
+  --     индекс 2 ("Early"). Значит индекс меньше пяти — это рано, а Good(4)
+  --     стоит на ранней стороне от Perfect(5). Мы недодерживаем;
+  --   * величина видна по ширине грина: при окне 0.050..0.090 Perfect выходит
+  --     в 89% случаев (8 из 9), при 0.020..0.035 — в 17%, при <0.020 — в 0%.
+  --     Стоять в центре и промахиваться из-за УЗКОГО окна нельзя: узкое окно
+  --     всё равно накрывает свой центр. Значит центр от нас в стороне ровно
+  --     на полуширину окна, которое перестаёт нас доставать.
+  -- Величина шага взята НАМЕРЕННО ВДВОЕ МЕНЬШЕ оценки: та же лестница по
+  -- единственному замеру даёт около 0.07 на полосу, полуширина Perfect выходит
+  -- порядка 0.035, и ставить сразу всю поправку значит рискнуть уехать в
+  -- Slightly Late. Полшага не может ухудшить: мы всё ещё на ранней стороне.
+  -- В отчёте есть строка release с полем bands — по ней и решаем дальше:
+  -- ушло к нулю, значит идём ещё; ушло в плюс, значит откатываем.
+  Bias      = 0.015,
   PingBase  = 0.0,
   PingCoef  = 0.94,
 
@@ -197,6 +220,33 @@ local CFG = {
 
     RimAttackRad = 14,
     RimAttackCD  = 0.45,
+
+    -- ЛОБ НА СВОЁ ЖЕ КОЛЬЦО — ЭТО АТАКА, А НЕ ПЕРЕДАЧА.
+    -- Соперник кидает мяч себе (или своему) на щит и добивает данком. По всем
+    -- формальным признакам это чужая передача, и скрипт от неё отказывался
+    -- ТРИЖДЫ: в охране кольца, в подборе у кольца и в хвате. В дампе это 1073
+    -- + 5948 + 3741 отказов за сессию. Разворачивались мы уже под забитый мяч.
+    LobGuard = true,
+    -- Насколько близко к защищаемому кольцу должен прийти мяч, чтобы считать
+    -- это атакой сверху, а не передачей мимо.
+    LobRad   = 10.0,
+    -- Насколько ниже кольца дуга ещё считается «в кольцо». Мяч, катящийся по
+    -- полу мимо стойки, к кольцу отношения не имеет.
+    LobDrop  = 2.5,
+    -- Наклон дуги в точке подхода: во сколько раз падение больше смещения по
+    -- горизонтали. Именно он и отличает лоб от передачи, см. комментарий в
+    -- intoOurRim. 0.6 это примерно 31 градус.
+    LobSlope = 0.6,
+    -- Верхняя граница полосы вокруг кольца. Выше этого мяч до кольца ещё не
+    -- долетел, и близость по горизонтали там ничего не значит.
+    LobUp    = 4.0,
+    -- Запас, с которым мы обязаны успеть к мячу раньше него, чтобы предпочесть
+    -- перехват защите. Не успеваем — идём телом, как и просил игрок.
+    LobLead  = 0.20,
+    -- Насколько далеко от точки прихода мяча должен быть соперник, чтобы имело
+    -- смысл идти за мячом, а не за ним. Стоит он под мячом — забирать нечего,
+    -- он снимет его в прыжке; наше дело тогда мешать телом и прыжком.
+    LobClear = 6.0,
 
     Catch        = true,
 
@@ -1547,6 +1597,18 @@ function PBX.hasBallLike(c)
   return a ~= nil and PBX.BALL_LIKE[a] == true
 end
 
+-- КОГО ЗАЩИТА СЧИТАЕТ НОСИТЕЛЕМ.
+-- Мяч в руках — очевидно. Ловящий лоб на наше кольцо — тоже: игра сама держит
+-- такого за игрока с мячом (Movement:331), а до данка остаются доли секунды.
+-- Раньше защита ждала атрибут Basketball, он появлялся уже в момент приёма, и
+-- выходить было поздно — ровно то, что видно снаружи как «стоим спиной».
+function PBX.carrierLike(c)
+  if hasBall(c) then return true end
+  if not (CFG.Grab.LobGuard and PBX.lobThreat) then return false end
+  local lf = PBX.lobThreat()
+  return lf ~= nil and lf == c
+end
+
 -- Бросок «живой» — это не только Action == "Shooting". Данк и лэйап тоже
 -- броски, и цикл взвода обязан ждать их так же.
 function PBX.liveShotAct(a)
@@ -1833,7 +1895,7 @@ local function pingCorr(R, pEff)
 end
 
 local function effTarget(R, pEff)
-  return math.max(CFG.Target - pingCorr(R, pEff), CFG.TargetMin)
+  return math.max((CFG.Target + (CFG.Bias or 0)) - pingCorr(R, pEff), CFG.TargetMin)
 end
 
 -- zeroSprintSent переехал в HUB: верхних локалов в чанке Luau ровно 200,
@@ -2880,12 +2942,96 @@ PBX.OWN_BALL = { PickingUp = true, CatchingPass = true, AwaitingPass = true,
 -- Контрпризнак тоже есть: если по этому игроку зарегистрировался метр
 -- броска (MeterService.RegisterPacket), то это всё-таки бросок, а не пас.
 -- Прыгать нельзя только если пас адресован НЕ НАМ: свой ловим как обычно.
+-- КУДА ПРИДЁТ ЛЕТЯЩИЙ МЯЧ: В НАШЕ КОЛЬЦО ИЛИ МИМО.
+-- Считается один раз за кадр по уже построенной дуге. Смотрим только тот её
+-- участок, что идёт на высоте кольца или чуть ниже: мяч, катящийся по полу
+-- мимо стойки, формально проходит близко, а к кольцу отношения не имеет.
+PBX.rimMemo = { f = -1 }
+function PBX.intoOurRim()
+  local M = PBX.rimMemo
+  if M.f == HUB.frame then return M.v, M.d, M.t, M.p end
+  M.f, M.v, M.d, M.t, M.p = HUB.frame, false, nil, nil, nil
+  local info, hp = HUB.arc, hoopWeDefend()
+  if not (info and info.arc and hp) then return M.v end
+  -- ПОЛОСА ВОКРУГ КОЛЬЦА, А НЕ «ВСЁ ЧТО ВЫШЕ».
+  -- Без верхней границы под правило попадала дуга, которая круто снижается,
+  -- проходит в девяти студах от кольца, но на шесть студов ВЫШЕ него, а
+  -- приземляется за пятнадцать. Это не угроза кольцу, это длинный пас.
+  local floor = hp.Y - (CFG.Grab.LobDrop or 2.5)
+  local ceil  = hp.Y + (CFG.Grab.LobUp or 4.0)
+  local bd, bt, bp
+  local arc = info.arc
+  for i = 2, #arc do
+    local sp, pr = arc[i], arc[i-1]
+    -- На высоте кольца И ПАДАЕТ КРУТО. Просто «идёт вниз» мало: обычная
+    -- передача через трапецию тоже проходит близко к кольцу и на второй
+    -- половине снижается. Разделяет их УГОЛ. Проверка на стенде: у лоба под
+    -- данк наклон в точке подхода около 3 (то есть больше 70 градусов), у
+    -- передачи грудью поперёк площадки — 0.02. Порог 0.6 это примерно 31
+    -- градус, между ними с огромным запасом.
+    local drop = pr.p.Y - sp.p.Y
+    local horiz = ((sp.p - pr.p) * FLAT).Magnitude
+    if sp.p.Y >= floor and sp.p.Y <= ceil and drop > 0
+       and drop >= horiz * (CFG.Grab.LobSlope or 0.6) then
+      local d = ((sp.p - hp) * FLAT).Magnitude
+      if not bd or d < bd then bd, bt, bp = d, sp.t, sp.p end
+    end
+  end
+  if bd and bd <= (CFG.Grab.LobRad or 10) then
+    M.v, M.d, M.t, M.p = true, bd, bt, bp
+  end
+  return M.v, M.d, M.t, M.p
+end
+
+-- ...И ПОД НИМ ОБЯЗАН СТОЯТЬ СОПЕРНИК.
+-- Одной геометрии мало: мяч, летящий в сторону кольца, бывает и на обычной
+-- передаче через трапецию. Подпись алей-упа складывается из двух половин —
+-- мяч ПАДАЕТ в кольцо И у кольца ждёт соперник. Вместе это не спутать ни с
+-- чем, поэтому запрет «чужая передача» снимается только на такой паре.
+function PBX.rimBound(rcv)
+  if not (CFG.Grab.LobGuard and PBX.intoOurRim()) then return false end
+  local hp = hoopWeDefend(); if not hp then return false end
+  local rad = CFG.Grab.LobRad or 10
+  if rcv then
+    local p = posOf(sChild(rcv, "HumanoidRootPart"))
+    return (p ~= nil) and (((p - hp) * FLAT).Magnitude <= rad)
+  end
+  local pool, np = foeSnap()
+  for i = 1, np do
+    if ((pool[i].p - hp) * FLAT).Magnitude <= rad then return true end
+  end
+  return false
+end
+
+-- ПАС МИМО НАС — НЕ НАША ЗАБОТА. ПАС В НАШЕ КОЛЬЦО — ЕЩЁ КАК.
+-- Отказ «это чужая передача» стоял безусловным, и под него целиком попадал
+-- самый дешёвый способ забить: кинуть мяч себе на щит и добить данком. Игра
+-- при этом сама на нашей стороне — она считает ловящего лоб ИГРОКОМ С МЯЧОМ
+-- (Movement_ModuleScript:331 и Animations:141 берут ближайшего «с мячом» как
+-- Basketball ИЛИ Action из { CatchingPass, CatchingLob, Shooting, Dunking }),
+-- то есть его положено держать, а не пропускать. Снимаем запрет по одному
+-- геометрическому признаку: КУДА ПРИДЁТ МЯЧ. В наше кольцо — работаем.
+-- Передачу своему при этом не трогаем: перехватывать напарника незачем.
 function PBX.foreignPass(ball)
   local rcv = ball and PBX.passToCached(ball) or nil
-  if rcv ~= nil then return rcv ~= chr() end
+  if rcv ~= nil then
+    if rcv == chr() then return false end
+    if isEnemy(rcv) and PBX.rimBound(rcv) then
+      HUB.lobSeen = (HUB.lobSeen or 0) + 1
+      return false
+    end
+    return true
+  end
   if BALL.isPass ~= true then return false end
   local s = BALL.shooter
   if s and PBX.shotAge(s) then return false end
+  -- Получателя сервер ещё не назначил, а мяч уже падает в наше кольцо, и там
+  -- ждёт соперник. Свой бросок и пас напарника сюда не попадут: их отсекает
+  -- проверка автора.
+  if (s == nil or (s ~= chr() and isEnemy(s))) and PBX.rimBound(nil) then
+    HUB.lobSeen = (HUB.lobSeen or 0) + 1
+    return false
+  end
   return true
 end
 
@@ -3093,18 +3239,38 @@ local updateBall = LPH_NO_VIRTUALIZE(function()
     -- шестнадцати своих бросках. Считаем иначе, напрямую: мяч опустился до
     -- уровня кольца, идёт ВНИЗ, и по горизонтали он внутри радиуса
     -- засчитывания — то есть физически прошёл сквозь дужку.
-    if best.vel.Y < -1 then
+    -- ...И ПРОВЕРЯЕМ ОТРЕЗОК, А НЕ ТОЧКУ. ЭТО И ЕСТЬ ПРОПУЩЕННЫЕ ГОЛЫ.
+    -- Условие смотрело, лежит ли мяч ПРЯМО СЕЙЧАС в трёхстудовой полосе под
+    -- кольцом. Кадр у клиента 25..30 мс (замерено в этом же дампе по циклу
+    -- броска), а данк идёт сверху вниз быстро: за кадр мяч проходит три студа
+    -- и больше, то есть полосу можно перепрыгнуть целиком и гола не заметить.
+    -- Тогда пауза после гола не ставится, и скрипт бежит за мячом, которого в
+    -- игре уже нет — ровно то, о чём был отчёт. Считаем пересечение плоскости
+    -- кольца между прошлым и текущим кадром и меряем промах В ТОЧКЕ
+    -- ПЕРЕСЕЧЕНИЯ: тогда скорость мяча роли не играет вообще.
+    local sp0 = BALL.scanPrev
+    if best.vel.Y < -1 and sp0 and sp0.part == best.part
+       and (now - (sp0.t or 0)) < 0.35 then
       for _, hp2 in ipairs(hoopList()) do
-        if best.pos.Y <= hp2.Y and best.pos.Y >= hp2.Y - 3.0
-           and ((best.pos - hp2) * FLAT).Magnitude <= CFG.Traj.ScoreRad then
-          if (now - (HUB.scoredAt or -99)) > 1.5 then
-            HUB.scoredAt = now
-            HUB.scoredN = (HUB.scoredN or 0) + 1
+        if sp0.p.Y > hp2.Y and best.pos.Y <= hp2.Y then
+          local span = sp0.p.Y - best.pos.Y
+          local f = (span > 1e-4) and ((sp0.p.Y - hp2.Y) / span) or 0
+          local cross = sp0.p:Lerp(best.pos, math.clamp(f, 0, 1))
+          local miss = ((cross - hp2) * FLAT).Magnitude
+          if miss <= CFG.Traj.ScoreRad then
+            if (now - (HUB.scoredAt or -99)) > 1.5 then
+              HUB.scoredAt = now
+              HUB.scoredN = (HUB.scoredN or 0) + 1
+              HUB.scoreMiss = math.floor(miss * 100) / 100
+              HUB.scoreDrop = math.floor(span * 10) / 10
+            end
+            break
           end
-          break
         end
       end
     end
+    if not BALL.scanPrev then BALL.scanPrev = {} end
+    BALL.scanPrev.part, BALL.scanPrev.p, BALL.scanPrev.t = best.part, best.pos, now
     BALL.velSrc, BALL.stale = best.src, best.stale
     BALL.fitN = best.fitN
     BALL.state = "flight"
@@ -5887,7 +6053,9 @@ local function enemyCarrier()
   local hp = hoopWeDefend()
   local best, bd = nil, nil
   for _, c in ipairs(charsList()) do
-    if isEnemy(c) and hasBall(c) then
+    -- carrierLike, а не hasBall: ловящий лоб на наше кольцо это тоже носитель,
+    -- иначе Auto Move узнаёт о нём уже после данка.
+    if isEnemy(c) and PBX.carrierLike(c) then
       local p = posOf(sChild(c, "HumanoidRootPart"))
       if p then
         local d = hp and ((p - hp) * FLAT).Magnitude or 0
@@ -6158,6 +6326,94 @@ local function guardOnArc(arc, me, tMax, tOffset, label, dt, ballPart)
   return true
 end
 
+-- УГРОЗА СВЕРХУ: СВОБОДНЫЙ МЯЧ ИДЁТ В НАШЕ КОЛЬЦО, А ПОД НИМ СОПЕРНИК.
+-- Возвращает соперника, точку прихода мяча, время до неё и признак «мы
+-- успеваем к мячу раньше него».
+-- Два входа, и первый сильнее второго:
+--  1) Игра сама пометила ловящего: Action = CatchingLob и TargetBasketball на
+--     этот мяч. Это лоб, и ловящий по правилам игры уже владелец мяча.
+--  2) Признака нет (соперник просто закинул мяч на щит и бежит добивать) —
+--     тогда решает геометрия: мяч придёт в кольцо, и ближе всех к точке
+--     прихода стоит соперник.
+-- Приоритет из требования игрока: сначала защита телом, и только если мы
+-- реально успеваем к мячу раньше — перехват.
+PBX.lobMemo = { f = -1 }
+function PBX.lobThreat()
+  local M = PBX.lobMemo
+  if M.f == HUB.frame then return M.c, M.p, M.t, M.first end
+  M.f, M.c, M.p, M.t, M.first = HUB.frame, nil, nil, nil, false
+  if not (CFG.Grab.LobGuard and CFG.Grab.Enabled) then return nil end
+  if BALL.holder ~= nil or PBX.ballIsOurs() then return nil end
+  local info, hp = HUB.arc, hoopWeDefend()
+  if not (info and info.arc and hp) then return nil end
+  local into, _, tRim, pRim = PBX.intoOurRim()
+
+  local rcv = PBX.passToCached(info.ball)
+  local lobRcv = nil
+  if rcv and rcv ~= chr() and isEnemy(rcv)
+     and sAttr(rcv, "Action") == "CatchingLob" then lobRcv = rcv end
+  if not (into or lobRcv) then return nil end
+
+  local pt = pRim or hp
+  local foe, fd = lobRcv, nil
+  if not foe then
+    -- Кто стоит под точкой прихода. Считаем угрозой только соперника: свой
+    -- подбор перехватывать незачем.
+    local pool, np = foeSnap()
+    for i = 1, np do
+      local e = pool[i]
+      local d = ((e.p - pt) * FLAT).Magnitude
+      if d <= (CFG.Grab.LobRad or 10) and ((not fd) or d < fd) then foe, fd = e.c, d end
+    end
+    if not foe then return nil end
+  else
+    -- Помеченного игрой ловящего дистанцией не искали, а она нужна ниже:
+    -- без неё перехват никогда не выбирался бы даже при пустом кольце.
+    local fp = posOf(sChild(foe, "HumanoidRootPart"))
+    if fp then fd = ((fp - pt) * FLAT).Magnitude end
+  end
+
+  -- УСПЕВАЕМ ЛИ МЫ К МЯЧУ РАНЬШЕ НЕГО — И ЭТО РЕШАЕТ, ЧТО ДЕЛАТЬ.
+  -- Порядок задан игроком: телом лучше, но если мяч реально наш — берём мяч.
+  -- Считаем честно: добежать до точки прихода, успеть до её времени с запасом,
+  -- и чтобы мяч там был в пределах досягаемости. Плюс дешёвый признак «мы и
+  -- так ближе всех»: тогда это вообще наш подбор, а не его атака.
+  local me = selfPos()
+  if me then
+    -- ТОЧКА ПЕРЕХВАТА — НЕ ТА ЖЕ, ЧТО ТОЧКА НАКРЫТИЯ.
+    -- Ближе всего к кольцу мяч проходит НАД ним, часто выше нашей вытянутой
+    -- руки: на самой этой точке брать нечего. Для «успеваем ли» ищем первый
+    -- участок дуги, где мяч уже у кольца И на доставаемой высоте.
+    local reach, rad = JP.reachY(), (CFG.Grab.LobRad or 10)
+    local qp, qt
+    for _, sp in ipairs(info.arc) do
+      local dy = sp.p.Y - me.Y
+      if dy >= -2 and dy <= reach and ((sp.p - hp) * FLAT).Magnitude <= rad then
+        qp, qt = sp.p, sp.t; break
+      end
+    end
+    if qp and qt then
+      -- «УСПЕТЬ ПО ЧАСАМ» И «ЗАБРАТЬ МЯЧ» — РАЗНЫЕ ВЕЩИ.
+      -- Сначала здесь стояла чистая проверка времени: добежим ли мы до точки
+      -- раньше, чем туда придёт мяч. На стенде она сразу дала неправильный
+      -- ответ: мы в четырёх студах, добегаем за 0.28 с при мяче через 1.07 с —
+      -- формально успеваем, а соперник в это время УЖЕ СТОИТ под мячом в
+      -- полустуде и снимает его в прыжке. Часы тут ни при чём, решает он.
+      -- Правило ровно такое, как сформулировал игрок: перехват только если
+      -- соперника рядом с точкой НЕТ.
+      local run = ((qp - me) * FLAT).Magnitude
+      M.first = (fd ~= nil) and (fd >= (CFG.Grab.LobClear or 6.0))
+                and ((run / math.max(ourSpeed(), 1) + (CFG.Grab.LobLead or 0.2)) <= qt)
+      M.catch, M.catchT = qp, qt
+    end
+  end
+  M.c, M.p, M.t = foe, pt, tRim
+  HUB.lobWhy = ("%s under a ball landing %.1f stds from the rim in %s")
+    :format(foe.Name, ((pt - hp) * FLAT).Magnitude,
+            tRim and ("%.0f ms"):format(tRim * 1000) or "?")
+  return M.c, M.p, M.t, M.first
+end
+
 local function rimGuardTick(dt)
   if not (CFG.Grab.Enabled and CFG.Grab.RimGuard) then return false end
   if CFG.Grab.OnlyInMatch and not PBX.inMatch() then
@@ -6284,6 +6540,21 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
 
     if hp then
 
+      -- КТО ЛОВИТ ЛОБ — ТОТ АТАКУЕТ КОЛЬЦО, И ЗНАТЬ ОБ ЭТОМ НАДО ЗАРАНЕЕ.
+      -- До самого данка Action у него не Dunking, поэтому ветка ниже молчала
+      -- всю дорогу и просыпалась, когда мяч уже был в кольце. Порядок такой,
+      -- как просил игрок: если мы реально успеваем к мячу раньше него — идём
+      -- за мячом (ветка подбора ниже), если нет — идём телом.
+      local lobFoe, lobPt, lobT, lobFirst = PBX.lobThreat()
+      if lobFoe and lobFirst then
+        HUB.lobMode = "we beat him to the ball"
+        lobFoe = nil
+      elseif lobFoe then
+        HUB.lobMode = "guarding the rim, he gets there first"
+      else
+        HUB.lobMode = nil
+      end
+
       local fpool, fn = foeSnap()
       for fi = 1, fn do
         local fe = fpool[fi]
@@ -6298,7 +6569,10 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
         -- "rim attack jump" и ни одного "rim attack closing". Ветка мертва,
         -- и кольцо от данков не защищалось вообще.
         -- Замах (windup) мяч ещё держит, там проверка осмысленна.
-        if (k == "rim") or (k == "windup" and fe.ball) then
+        -- Третий вход в ту же ветку: он ловит лоб на наше кольцо. Это ещё не
+        -- данк, но будет им через доли секунды, и выходить надо СЕЙЧАС.
+        local isLob = (c == lobFoe)
+        if (k == "rim") or (k == "windup" and fe.ball) or isLob then
           local cp = fe.p
           if cp then
             local toHoop = ((cp - hp) * FLAT).Magnitude
@@ -6306,13 +6580,34 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
             if toHoop <= CFG.Grab.RimAttackRad then
               sawRim = true
               if toUs <= CFG.Grab.BlockRange then
-                if (os.clock() - (HUB.lastRimAtk or 0)) >= CFG.Grab.RimAttackCD
+                -- ПРЫЖОК НА ЛОБ ТАЙМИТСЯ ПО МЯЧУ, А НЕ ПО ЧЕЛОВЕКУ.
+                -- На данке прыгать надо сразу: он уже в воздухе. На лобе мяч
+                -- ещё летит, и прыжок «прямо сейчас» сгорает впустую вместе с
+                -- кулдауном. Ждём, пока до прихода мяча останется ровно наше
+                -- упреждение, и прыгаем по той же модели, что и весь подбор.
+                local jumpNow, jTgt, jT, jDy = true, cp, 0, (cp.Y - me.Y) + CFG.Grab.BallUp
+                if isLob and (k ~= "rim") and lobPt and lobT then
+                  jTgt, jT = lobPt, lobT
+                  jDy = lobPt.Y - me.Y
+                  jumpNow = (lobT <= JP.jumpLead(jDy))
+                  if not jumpNow then
+                    PBX.why("blockWhy", "lob incoming: %s, ball in %.0f ms, jump at %.0f ms",
+                            c.Name, lobT * 1000, JP.jumpLead(jDy) * 1000)
+                    PBX.gs("lob: waiting for the jump window", lobT)
+                    faceBall(lobPt, dt)
+                    return
+                  end
+                end
+                if jumpNow
+                   and (os.clock() - (HUB.lastRimAtk or 0)) >= CFG.Grab.RimAttackCD
                    and (os.clock() - (HUB.lastJump or 0)) >= CFG.Grab.JumpCD then
                   HUB.lastRimAtk = os.clock()
-                  HUB.blockWhy = ("rim attack: %s, %.1f from hoop, %.1f from us")
-                    :format(tostring(sAttr(c, "Action")), toHoop, toUs)
-                  PBX.gs("rim attack jump", toUs)
-                  doJump(HUB.blockWhy, cp, dt, cp, 0, (cp.Y - me.Y) + CFG.Grab.BallUp)
+                  HUB.blockWhy = ("%s: %s, %.1f from hoop, %.1f from us")
+                    :format(isLob and (k ~= "rim") and "lob block" or "rim attack",
+                            tostring(sAttr(c, "Action")), toHoop, toUs)
+                  PBX.gs(isLob and (k ~= "rim") and "lob block jump"
+                                or "rim attack jump", toUs)
+                  doJump(HUB.blockWhy, jTgt, dt, jTgt, jT, jDy)
                   return
                 end
 
@@ -6335,9 +6630,11 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
                 end
                 steerTo(cp, "grab")
                 faceBall(cp, dt)
-                PBX.why("blockWhy", "rim attack: %s at %.1f from hoop, closing %.1f",
+                PBX.why("blockWhy", "%s: %s at %.1f from hoop, closing %.1f",
+                        (isLob and k ~= "rim") and "lob incoming" or "rim attack",
                         tostring(fe.act), toHoop, toUs)
-                PBX.gs("rim attack closing", toUs)
+                PBX.gs((isLob and k ~= "rim") and "lob closing"
+                                              or "rim attack closing", toUs)
                 return
               end
             end
@@ -6695,10 +6992,22 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
     stopSteer("grab"); PBX.gs("fit not ready"); return
   end
 
+  -- «БРОСОК ЗАХОДИТ, ЖДЁМ ВБРАСЫВАНИЕ» — НО НЕ КОГДА ПОД КОЛЬЦОМ ЖДЁТ ОН.
+  -- Skip Makes существует, чтобы не гоняться за уже забитым мячом. Беда в
+  -- том, что лоб, точно закинутый на кольцо, по дуге неотличим от заходящего
+  -- броска: hits становится true, и мы отходили в сторону — то есть именно на
+  -- той атаке, которую надо накрывать, отключались сами. Проверка стояла ВЫШЕ
+  -- разбора «пас это или нет», поэтому её не спасал и снятый запрет на лоб.
+  -- Если под мячом стоит соперник, это не забитый мяч, а мяч, который сейчас
+  -- добьют, и уходить нельзя.
   if info.hits and CFG.Grab.SkipMakes then
-    stopSteer("grab")
-    PBX.gs("shot is going in, waiting for the inbound", HUB.scoreDist)
-    return
+    local lobFoe = PBX.lobThreat()
+    if not lobFoe then
+      stopSteer("grab")
+      PBX.gs("shot is going in, waiting for the inbound", HUB.scoreDist)
+      return
+    end
+    PBX.gs("looks like a make, but he is under it")
   end
 
   if PBX.foreignPass(info.ball) then
@@ -7079,7 +7388,9 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
   local target, bd, skipped = nil, nil, 0
   local covered, coveredWhy = 0, nil
   for _, c in ipairs(charsList()) do
-    if isEnemy(c) and hasBall(c) then
+    -- То же самое и здесь: соперник, ловящий лоб на наше кольцо, обязан быть
+    -- подопечным ещё до того, как мяч окажется у него в руках.
+    if isEnemy(c) and PBX.carrierLike(c) then
       local cp = posOf(sChild(c, "HumanoidRootPart"))
       if cp then
         local nearHoop = true
@@ -7885,7 +8196,7 @@ local function save()
     ping = dataPing(), pingSource = HUB.pingSource, pingFails = HUB.pingFails,
     stats = HUB.stats, shotCount = HUB.shotsTotal or #HUB.shots,
     shotsKept = #HUB.shots,
-    cfg = { Target = CFG.Target, PingBase = CFG.PingBase, PingCoef = CFG.PingCoef,
+    cfg = { Target = CFG.Target, Bias = CFG.Bias, PingBase = CFG.PingBase, PingCoef = CFG.PingCoef,
             RateFlat = CFG.RateFlat, UseFittedRate = CFG.UseFittedRate,
             RateLo = CFG.RateLo, RateHi = CFG.RateHi, RateMinN = CFG.RateMinN,
             TickRate = CFG.TickRate, MinFitN = CFG.Traj.MinFitN,
@@ -7909,6 +8220,16 @@ local function save()
     shotNoStart = HUB.shotNoStart, shotRetry = HUB.shotRetry,
     spoofWhy = HUB.spoofWhy,
     ballIsPass = BALL.isPass, ballHoldAct = BALL.holdAct,
+    lobGuard = CFG.Grab.LobGuard, lobRad = CFG.Grab.LobRad,
+    lobSeen = HUB.lobSeen or 0, lobWhy = HUB.lobWhy, lobMode = HUB.lobMode,
+    lobNow = (function()
+      local c, p2, t2, first = PBX.lobThreat()
+      if not c then return nil end
+      return ("%s, ball in %s, %s"):format(c.Name,
+        t2 and ("%.0f ms"):format(t2*1000) or "?",
+        first and "we get there first" or "he gets there first")
+    end)(),
+    scoreMiss = HUB.scoreMiss, scoreDrop = HUB.scoreDrop,
     blatantSkipCD = HUB.blatantSkipCD, ghostSelfHealed = HUB.ghostSelfHealed,
     blatantBackPending = (BL and BL.backDelta ~= nil) or nil,
     -- Ключ броска той цели, которую видим сейчас: по нему в следующем дампе
@@ -7993,7 +8314,7 @@ local function save()
     slipPress = HUB.slipPress, slipSep = HUB.slipSep,
     noclipParts = HUB.noclipParts, ghostParts = HUB.ghostParts,
     goalRadBase = CFG.Grab.GoalRad, maxSlack = CFG.Traj.MaxSlack,
-    target = CFG.Target,
+    target = CFG.Target + (CFG.Bias or 0),
     shotCancelled = HUB.shotCancelled, shotDead = HUB.shotDead,
     pingBase = CFG.PingBase, pingCoef = CFG.PingCoef,
 
@@ -8180,6 +8501,14 @@ local function save()
   end
   rep(("[PB] ball nature: last holder action %s | treated as a pass: %s")
     :format(tostring(BALL.holdAct or "-"), tostring(BALL.isPass)))
+  rep(("[PB] lob guard: on=%s radius %.0f | passes reclaimed as attacks %d | right now: %s | plan: %s")
+    :format(tostring(meta.lobGuard), meta.lobRad or 0, meta.lobSeen or 0,
+            tostring(meta.lobNow or "nothing incoming"),
+            tostring(meta.lobMode or "-")))
+  rep(("[PB] scores: seen %d | last one crossed the rim %s stds off centre, dropping %s stds that frame")
+    :format(HUB.scoredN or 0,
+            meta.scoreMiss and ("%.2f"):format(meta.scoreMiss) or "-",
+            meta.scoreDrop and ("%.1f"):format(meta.scoreDrop) or "-"))
   do
     local t = {}
     for k, n in pairs(HUB.steerN or {}) do t[#t+1] = ("%s x%d"):format(k, n) end
@@ -8233,12 +8562,12 @@ local function save()
         n += 1; sum += sh.srvMeter
         if not lo or sh.srvMeter < lo then lo = sh.srvMeter end
         if not hi or sh.srvMeter > hi then hi = sh.srvMeter end
-        if math.abs(sh.srvMeter - CFG.Target) <= pw then inw += 1 end
+        if math.abs(sh.srvMeter - (CFG.Target + (CFG.Bias or 0))) <= pw then inw += 1 end
       end
     end
     if n > 0 then
       rep(("[PB] server meter: avg %.3f, range %.3f..%.3f | inside Perfect %d/%d (target %.3f +-%.4f)")
-        :format(sum/n, lo, hi, inw, n, CFG.Target, pw))
+        :format(sum/n, lo, hi, inw, n, CFG.Target + (CFG.Bias or 0), pw))
       -- КУДА МЫ МАЖЕМ ПО ВРЕМЕНИ — ПО ВЕРДИКТУ, А НЕ ПО СВОЕЙ ЖЕ МОДЕЛИ.
       -- srvMeter это наш расчёт, и сверять модель с моделью бессмысленно.
       -- Вердикт же приходит от сервера номером полосы, а лестница у игры
@@ -8298,7 +8627,8 @@ local function save()
       if pn > 0 then
         rep(("[PB] Perfect centre %.4f (n=%d) | Good centre %s | target %.4f | bias %+.4f")
           :format(ps/pn, pn, gn > 0 and ("%.4f"):format(gs/gn) or "-",
-                  CFG.Target, ps/pn - CFG.Target))
+                  CFG.Target + (CFG.Bias or 0),
+                  ps/pn - (CFG.Target + (CFG.Bias or 0))))
       end
       -- ЧТО ИМЕННО ИСПОРТИЛО БРОСОК: наш тайминг или контест.
       -- Три «Slightly Late» подряд в дампе имели contest 74..89 и грин в полу —
@@ -9311,6 +9641,10 @@ return function(_Lib, _Core)
 
       s1:SubLabel({ Text = ("Target %.4f (Perfect centre measured 1.517)")
         :format(CFG.Target) })
+      slider(s1, { Name = "Hold Longer", Flag = "AG_Bias", Default = CFG.Bias,
+        Min = -0.05, Max = 0.05, Precision = 3,
+        Callback = function(v) CFG.Bias = v end,
+        Desc = "shifts the release later, the dump prints bands: 0 means centred" })
       slider(s1, { Name = "Ping Factor", Flag = "AG_PingCoef", Default = CFG.PingCoef,
         Min = 0.50, Max = 1.30, Precision = 2,
         Callback = function(v) CFG.PingCoef = v end })
@@ -9717,6 +10051,14 @@ return function(_Lib, _Core)
         "after a score, a foul or a whistle the ball cannot be taken at all",
         function() return CFG.Grab.SkipDead end,
         function(v) CFG.Grab.SkipDead = v end, "GRAB_SkipDead")
+      bool(s3, "Guard The Lob",
+        "a ball dropping into your own rim with a man under it is an attack, not a pass",
+        function() return CFG.Grab.LobGuard end,
+        function(v) CFG.Grab.LobGuard = v end, "GRAB_LobGuard")
+      slider(s3, { Name = "Lob Radius", Flag = "GRAB_LobRad", Default = CFG.Grab.LobRad,
+        Min = 4, Max = 20, Precision = 1,
+        Callback = function(v) CFG.Grab.LobRad = v end,
+        Desc = "how close to the rim the ball has to land, and how close he has to be" })
       slider(s3, { Name = "Dead Ball Wait", Flag = "GRAB_DeadWait",
         Default = CFG.Grab.DeadAfterScore, Min = 0, Max = 6, Precision = 1, Suffix = " s",
         Callback = function(v) CFG.Grab.DeadAfterScore = v end,
