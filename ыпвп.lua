@@ -1,4 +1,4 @@
---[[ PRACTICAL BASKETBALL v144 — Potassium/UNC — модуль для лоадера Syllinse ]]
+--[[ PRACTICAL BASKETBALL v145 — Potassium/UNC — модуль для лоадера Syllinse ]]
 
 -- Luraph macro prelude. Installed through STRING KEYS on the global env so a
 -- bare macro token never appears in real code (that would abort Luraph). Raw,
@@ -20,7 +20,7 @@ do
   end
 end
 
-local VERSION = 144
+local VERSION = 145
 
 local CFG = {
 
@@ -92,6 +92,14 @@ local CFG = {
   -- Раньше вторая жила внутри первой и без неё не включалась вовсе.
   S3 = {
     Enabled = false,
+    -- ДВА СПОСОБА СДЕЛАТЬ ИЗ ДВОЙКИ ТРОЙКУ.
+    -- Teleport показывает серверу точку за дугой ровно на регистрации —
+    -- быстро и работает из любого положения, но это подмена позиции.
+    -- Legit уводит НОГАМИ: сервер видит настоящую дистанцию, подменять
+    -- нечего. Медленнее и требует запаса времени в замахе.
+    Mode     = "Teleport",
+    StepTime = 0.30,   -- сколько длится отход назад в режиме Legit
+    Speed    = 26,     -- скорость отхода, пишется в скорость напрямую
     -- Расстояние трёхочковой линии от кольца. Единственное, с чем сравнивают
     -- дистанцию до игрока. Разметку площадки скрипт меряет отдельно и только
     -- печатает в дампе, чтобы это число можно было выставить по факту.
@@ -222,7 +230,12 @@ local CFG = {
     LagMax   = 0.80,
 
     PingUp    = 0.5,
-    JumpEarly = 0.040,
+    -- ЗАМЕР ПО ПОСЛЕДНЕМУ ДАМПУ, 10 ПРЫЖКОВ.
+    -- arrErr: -419 -223 -172 -154 -69 -55 -19 +9 +10 +12 мс. Минус означает,
+    -- что мяч пришёл РАНЬШЕ расчёта, то есть мы прыгнули поздно. Среднее
+    -- -108 мс тянет один выброс, медиана честнее: -62 мс. Поднимаем ровно на
+    -- эту величину, 0.040 -> 0.100. Это не подстройка на лету — число задано.
+    JumpEarly = 0.100,
 
     Anticipate  = true,
 
@@ -299,6 +312,13 @@ local CFG = {
     -- всё время, пока соперник целится: контест копится, пока защитник
     -- рядом и в стойке. Держать её те же 0.12 с бессмысленно.
     StanceTime = 0.80,
+    -- СКОЛЬКО ВРЕМЕНИ ДОБИВАЕМСЯ ПРЫЖКА. Один пакет Jump может не дойти или
+    -- прийти в Debounce; повторяем, пока сервер не поднимет InAir.
+    JumpWindow = 0.45,
+    -- ЗАМАХ ВПЛОТНУЮ К КОЛЬЦУ СЧИТАЕМ ДАНКОМ ЗАРАНЕЕ. Ждать смены Action на
+    -- Dunking нельзя: атрибут идёт с сервера, плюс замеренный лаг прыжка
+    -- 0.36..0.51 с — накрытие выходило уже после мяча. 0 выключает догадку.
+    RimGuess  = 11,
     DunkRise  = 3.0,   -- добавка к высоте, когда он идёт данком или лэйапом
     Cooldown = 0.30,
     -- ПОРОГ ПО МЕТРУ ВРАГА. Раньше вход был только по Action = rim/windup, а
@@ -326,9 +346,21 @@ local CFG = {
 
     StandShoot = 3.5,
     StandBase  = 6.0,
+    -- Упреждение — это ВРЕМЯ в секундах, на которое мы двигаем ЕГО вперёд по
+    -- его же скорости, а потом строим линию на кольцо уже оттуда.
     LeadLat    = 0.1,
     LeadLatDrib= 0.2,
     LeadFwd    = 0.1,
+    -- ПОТОЛОК УПРЕЖДЕНИЯ, И ОН НАМЕРЕННО МАЛЕНЬКИЙ.
+    -- Скорость соперника мы берём из charVel, а она СГЛАЖЕНА: Lerp с
+    -- коэффициентом 0.4 по окну 0.04 с, то есть сама по себе отстаёт примерно
+    -- на 0.1 с. Экстраполировать такой сигнал ещё на 0.2 с — значит ставить
+    -- точку туда, куда он двигался два тика назад. Замер на стенде: при
+    -- ведении вбок на 14 стд/с старая схема уводила точку на 2.62 студа от
+    -- линии «он — кольцо», геометрия исправлена, но при потолке 2.5 остаётся
+    -- 1.85. С потолком 1.2 остаётся 0.85, и это уже меньше мёртвой зоны.
+    -- Кому нужна агрессивная подстраховка на проходе — ползунок Lead Cap.
+    LeadMax    = 1.2,
     BlowbyDot  = 0.4,
     BlowbySpeed= 9,
     BlowbyGap  = 8.5,
@@ -452,6 +484,34 @@ local CFG = {
     FromStart = true,
     Lead      = 0.20,
     Tail      = 0.10,
+    -- СПРИНТ ЕСТЬ, НО СЕРВЕР О НЁМ НЕ ЗНАЕТ.
+    -- KillSprint снимает спринт только на время броска. HideSprint глушит сам
+    -- канал: пакет Sprint до сервера не доходит НИКОГДА, атрибут Sprinting
+    -- остаётся false, и разброс за бег на месте не начисляется вовсе.
+    -- Скорость при этом не теряется — прибавку мы пишем в скорость сами.
+    HideSprint = false,
+  },
+
+  -- ОТБРОС ЧЕРЕЗ РАССИНХРОН СКОРОСТИ.
+  -- Три способа, потому что движок затыкает их по очереди и что именно живо
+  -- сейчас — проверяется только на месте. Наше настоящее тело закреплено,
+  -- сталкивается ProxyCharacter — работаем с ним.
+  Fling = {
+    Enabled  = false,
+    Method   = "Velocity",
+    Power    = 90000,
+    Radius   = 14,
+    Duration = 1.20,
+    Foes     = true,   -- только соперники, иначе любой ближайший игрок
+    SimBoost = true,   -- поднять SimulationRadius, без него часто не берёт
+  },
+
+  Vis = {
+    Zones    = false,  -- круги зон работы на площадке
+    Path     = false,  -- стрелки: куда скрипт ведёт и что делает
+    Segments = 40,
+    Thick    = 2,
+    Labels   = true,
   },
 
   AntiDef = {
@@ -571,6 +631,28 @@ end
 
 local function track(c) table.insert(HUB.conns, c); return c end
 
+-- ДИАГНОСТИЧЕСКИЕ СТРОКИ СТОИЛИ КАДРА, И НЕМАЛО.
+-- Пояснения вида "shooting 320 ms, release in 120 ms, lead 90 ms, dist 4.2/6.1"
+-- собирались КАЖДЫЙ кадр в кадровых тиках, пока условие вообще выполнялось.
+-- string.format с шестью-восемью аргументами — это новая строка в куче на
+-- каждый вызов, плюс постоянное давление на сборщик мусора. Читает их
+-- человек в дампе, а не код: пяти обновлений в секунду более чем достаточно.
+HUB.whyAt = {}
+-- Предикат отдельно от записи: там, где в аргументах сами по себе стоят
+-- format и concat, проверять надо ДО их вычисления, иначе экономии нет.
+function PBX.whyDue(key)
+  local now = os.clock()
+  local t = HUB.whyAt[key]
+  if t and (now - t) < 0.2 then return false end
+  HUB.whyAt[key] = now
+  return true
+end
+function PBX.why(key, fmt, ...)
+  if not PBX.whyDue(key) then return end
+  local ok, s = pcall(string.format, fmt, ...)
+  HUB[key] = ok and s or fmt
+end
+
 -- ОДНА ОШИБКА НЕ ДОЛЖНА УБИВАТЬ ПОДПИСКУ НАВСЕГДА.
 -- Кадровые тики висят на Heartbeat напрямую: любая ошибка внутри рвёт
 -- соединение, и фича молча перестаёт существовать до перезапуска скрипта.
@@ -599,6 +681,8 @@ local function weakKeys(t) return setmetatable(t, { __mode = "k" }) end
 -- Одна функция на запись CanCollide вместо замыкания на КАЖДУЮ деталь в
 -- покадровых циклах Ghost Opponents и NoClip.
 function PBX.setCC(x, v) x.CanCollide = v end
+-- То же самое для видимости объектов Drawing, и по той же причине.
+function PBX.setVis(x, v) x.Visible = v end
 weakKeys(HUB.shootAt)
 
 -- СЧЁТЧИК КАДРОВ ДЛЯ ПОКАДРОВЫХ КЭШЕЙ.
@@ -667,6 +751,26 @@ if R.SetCF then
 end
 local function physAllowed()
   return (os.clock() - HUB.serverCF) > CFG.Stealth.BackoffAfterServerCF
+end
+
+-- ЕДИНСТВЕННЫЙ ВЫХОД СПРИНТА НА СЕРВЕР.
+-- Раньше пакет Sprint уходил из восьми разных мест напрямую через
+-- Mt.FireServer, и такой вызов НЕ проходит через хук namecall — то есть
+-- перехватить его было негде. Пока все отправки не собраны в одну точку,
+-- «спринт есть, а сервер о нём не знает» сделать нельзя: свои же подсистемы
+-- (авто-спринт, ведение к точке, отпускание руля) продолжали бы его выдавать.
+HUB.wantSprint = false
+function PBX.sprintSend(v)
+  v = v and true or false
+  HUB.wantSprint = v
+  if CFG.Zero.Enabled and CFG.Zero.HideSprint then
+    HUB.sprintHidden = (HUB.sprintHidden or 0) + 1
+    return
+  end
+  local prev = HUB.bypass
+  HUB.bypass = true
+  pcall(Mt.FireServer, R.Sprint, v)
+  HUB.bypass = prev
 end
 
 local function sAttr(i,n)
@@ -871,13 +975,19 @@ end })
 -- персонажем, так что учащение почти ничего не стоит.
 task.spawn(function() while HUB.running do bindMeter(); task.wait(0.25) end end)
 
-local function meterPoll()
-  local v = sAttr(chr(), "meterOffset")
-  if typeof(v)=="Vector2" then
-    local ax,ay = math.abs(v.X), math.abs(v.Y); return (ay>ax) and ay or ax
-  elseif type(v)=="number" then return math.abs(v) end
+-- Метр приходит либо как Vector2 (сдвиг градиента), либо как число. Одна
+-- функция на все места, где его читают: раньше в трёх точках стояло по
+-- анонимному замыканию, создаваемому заново на каждый вызов, и два из них
+-- были в кадровых тиках.
+function PBX.meterOf(c)
+  local v = sAttr(c, "meterOffset")
+  if typeof(v) == "Vector2" then
+    local ax, ay = math.abs(v.X), math.abs(v.Y)
+    return (ay > ax) and ay or ax
+  elseif type(v) == "number" then return math.abs(v) end
   return nil
 end
+local function meterPoll() return PBX.meterOf(chr()) end
 
 HUB.shooting = weakKeys({})
 
@@ -1194,6 +1304,24 @@ function PBX.shotKind(c)
 end
 function PBX.isShot(c) return PBX.shotKind(c) ~= nil end
 
+-- АТАКА НА КОЛЬЦО, КОТОРУЮ НАДО НАКРЫВАТЬ ПРЫЖКОМ, А НЕ СТОЙКОЙ.
+-- Два признака. Первый честный: Action уже стал данком или лэйапом. Второй —
+-- УПРЕЖДАЮЩИЙ: замах (Gathering) вплотную к кольцу данком и заканчивается,
+-- а ждать смены Action нельзя. Атрибут приходит с сервера (плюс пинг), плюс
+-- замеренный лаг прыжка 0.36..0.51 с — суммарно почти полсекунды опоздания,
+-- и накрытие всегда выходило после того, как мяч уже в кольце.
+function PBX.rimAttack(c, why, kind)
+  if why == "rim attack" then return true end
+  if PBX.SHOT_RIM[sAttr(c, "Action")] == true then return true end
+  local g = CFG.Blatant.RimGuess
+  if not (g and g > 0) then return false end
+  if kind ~= "windup" and PBX.shotKind(c) ~= "windup" then return false end
+  local cp = posOf(sChild(c, "HumanoidRootPart"))
+  local hp = cp and PBX.nearHoop and PBX.nearHoop(cp) or nil
+  if not (cp and hp) then return false end
+  return ((cp - hp) * FLAT).Magnitude <= g
+end
+
 local function isEnemy(c)
   if not c or c == chr() then return false end
   if PK.side then
@@ -1407,6 +1535,9 @@ local function nearestHoop(from)
   end
   return best
 end
+-- PBX.rimAttack объявлена ВЫШЕ этой функции (её зовёт накрытие, а оно ещё
+-- выше), поэтому имя кладём в таблицу: прямая ссылка отсюда ушла бы в nil.
+PBX.nearHoop = nearestHoop
 
 local function pingCorr(R, pEff)
   R = R or CFG.RateFlat
@@ -1419,22 +1550,24 @@ local function effTarget(R, pEff)
   return math.max(CFG.Target - pingCorr(R, pEff), CFG.TargetMin)
 end
 
-local zeroUntil, zeroSprintSent = 0, false
+-- zeroSprintSent переехал в HUB: верхних локалов в чанке Luau ровно 200,
+-- и держать под флажок отдельный слот расточительно.
+local zeroUntil = 0
 local function zeroHold(sec)
   local Z = CFG.Zero
   if not Z.Enabled then return end
 
-  if os.clock() > zeroUntil then zeroSprintSent = false end
+  if os.clock() > zeroUntil then HUB.zeroSprintSent = false end
   zeroUntil = math.max(zeroUntil, os.clock() + (sec or 0))
-  if Z.KillSprint and not zeroSprintSent then
-    zeroSprintSent = true
+  if Z.KillSprint and not HUB.zeroSprintSent then
+    HUB.zeroSprintSent = true
 
-    HUB.bypass = true; pcall(Mt.FireServer, R.Sprint, false); HUB.bypass = false
+    PBX.sprintSend(false)
   end
 end
 local function zeroRelease()
   zeroUntil = 0
-  zeroSprintSent = false
+  HUB.zeroSprintSent = false
 end
 
 local function zeroKeep(t0)
@@ -1939,6 +2072,7 @@ local function spoofShot(g, startArgs)
   -- distSpoof = true от давнего дальнего броска. Снаружи это читается как
   -- «спуф срабатывает в радиусе кольца», хотя подмены не было вовсе.
   HUB.spoofInfo, HUB.smart3Info, HUB.spoofKept, HUB.s3Why = nil, nil, nil, nil
+  HUB.s3Walk = nil
   local pc, me = proxyPart(), selfPos()
   local hp = me and nearestHoop(me)
 
@@ -2008,6 +2142,14 @@ local function spoofShot(g, startArgs)
       elseif gap > CFG.S3.Window then
         HUB.s3Why = ("too far from the line: %.1f stds short, reach is %.1f")
           :format(gap, CFG.S3.Window)
+      elseif CFG.S3.Mode == "Legit" then
+        -- Ногами. why3 намеренно НЕ ставим: он служит признаком «подмена
+        -- позиции занята под тройку», а здесь подмены нет вовсе — значит
+        -- спуф дистанции остаётся свободен и может работать своим чередом.
+        HUB.s3Why = ("2->3 on foot: %.1f -> %.1f (line %.1f)")
+          :format(mine or realD, need, edge)
+        HUB.smart3Info = HUB.s3Why
+        if PBX.s3Step then task.spawn(PBX.s3Step, g, hp, need) end
       else
         want, useFake = need, true
         why3 = ("2->3: %.1f -> %.1f (line %.1f, %s)")
@@ -2114,6 +2256,21 @@ end
 
 local oldNamecall
 local hookFn = newcclosure(function(self, ...)
+
+  -- СПРИНТ, КОТОРОГО СЕРВЕР НЕ ВИДИТ.
+  -- Игра шлёт спринт своим Keyboard-контроллером через :FireServer, то есть
+  -- через этот же namecall. Глушим пакет и запоминаем НАМЕРЕНИЕ: атрибут
+  -- Sprinting на сервере остаётся false, значит и штрафа за движение в
+  -- броске нет. Прибавку к скорости мы дальше пишем сами, в хуке скорости.
+  -- Сравнение с R.Sprint стоит первым: это одна ссылка на равенство, и на
+  -- всех прочих namecall (а их тысячи в секунду) дальше не считается ничего.
+  if self == R.Sprint and not HUB.bypass
+     and CFG.Zero.Enabled and CFG.Zero.HideSprint
+     and getnamecallmethod() == "FireServer" then
+    HUB.wantSprint = ((...) == true)
+    HUB.sprintHidden = (HUB.sprintHidden or 0) + 1
+    return
+  end
 
   if self ~= R.Shoot or HUB.bypass
      or not (CFG.Enabled or CFG.Spoof.Enabled or CFG.S3.Enabled or CFG.Zero.Enabled
@@ -2559,9 +2716,16 @@ function PBX.hoopRay(cp, seg)
   local list = PBX.hoopParts()
   if #list == 0 then return nil end
   PBX.hpRP = PBX.hpRP or RaycastParams.new()
-  PBX.hpRP.FilterType = Enum.RaycastFilterType.Include
-  PBX.hpRP.FilterDescendantsInstances = list
-  pcall(function() PBX.hpRP.RespectCanCollide = false end)
+  -- СПИСОК ФИЛЬТРА ПЕРЕЗАПИСЫВАЛСЯ НА КАЖДЫЙ РЕЙКАСТ.
+  -- Запись FilterDescendantsInstances это копирование таблицы внутрь
+  -- RaycastParams, а зовут эту функцию до RayBudget = 24 раз за один марш.
+  -- hoopParts отдаёт ОДНУ И ТУ ЖЕ таблицу пять секунд — сравниваем ссылку.
+  if PBX.hpRPList ~= list then
+    PBX.hpRP.FilterType = Enum.RaycastFilterType.Include
+    PBX.hpRP.FilterDescendantsInstances = list
+    pcall(function() PBX.hpRP.RespectCanCollide = false end)
+    PBX.hpRPList = list
+  end
   local ok, hit = pcall(function() return Workspace:Raycast(cp, seg, PBX.hpRP) end)
   return ok and hit or nil
 end
@@ -2655,6 +2819,8 @@ local function ballTrueNow(pos, vel, stale)
 end
 
 local lines, marks = {}, {}
+-- Что мы в каждую линию УЖЕ записали: цвет, либо false для погашенной.
+local DRAWST = {}
 local function mkLine(i)
   if lines[i] == nil then
     local ok,d = pcall(function()
@@ -2680,9 +2846,20 @@ local function mkMark(i)
   end
   return marks[i] or nil
 end
+-- ГАСИЛИ КАЖДЫЙ КАДР, И КАЖДЫЙ РАЗ С НУЛЯ.
+-- Здесь на КАЖДУЮ линию создавалось анонимное замыкание ради pcall, а зовётся
+-- эта функция на каждом кадре, когда мяч не летит — по воронке это больше
+-- половины всех кадров. Полсотни мусорных функций в кадр на ровном месте,
+-- плюс полсотни записей свойства в уже погашенные объекты. Замыкание убрано,
+-- и повторный вызов не делает вообще ничего: гасить нечего.
 local function hideAll()
-  for _,l in pairs(lines) do if l then pcall(function() l.Visible=false end) end end
-  for _,m in pairs(marks) do if m then pcall(function() m.Visible=false end) end end
+  if HUB.drawHidden then return end
+  HUB.drawHidden = true
+  -- Слепок записанного обязан обнулиться вместе с гашением, иначе следующая
+  -- отрисовка тем же цветом решит, что писать нечего, и линии не покажутся.
+  table.clear(DRAWST)
+  for _,l in pairs(lines) do if l then pcall(PBX.setVis, l, false) end end
+  for _,m in pairs(marks) do if m then pcall(PBX.setVis, m, false) end end
 end
 
 HUB.arc = nil
@@ -2728,6 +2905,19 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
   HUB.arc = { arc = arc, hits = hits, hoopIdx = hi, hoopDist = hd,
               goal = gp, shooter = BALL.shooter, ball = BALL.part,
               fitN = BALL.fitN or 0 }
+
+  -- РИСОВАННУЮ ДУГУ СЧИТАЕМ ЗДЕСЬ ЖЕ, ОДИН РАЗ ЗА КАДР.
+  -- Она отличается от физической только числом точек и длиной, но цикл
+  -- отрисовки в RenderStepped гнал predictArc ЗАНОВО: ещё 48 шагов марша,
+  -- каждый с двумя рейкастами (бюджет 24). Вместе с этими 64 получалось до
+  -- 112 шагов и до 48 рейкастов НА КАДР — и по воронке видно, что рисовали
+  -- на половине всех кадров (105794 из 206331). Это и был главный расход.
+  if CFG.Traj.Enabled and trajVisible() then
+    HUB.arcDraw = predictArc(BALL.pos, BALL.vel, BALL.velSrc, BALL.stale,
+                             BALL.part, CFG.Traj.MapCheck)
+  else
+    HUB.arcDraw = nil
+  end
 
   HUB.predQ = HUB.predQ or { q = {}, fit = { n=0, sum=0, max=0 },
                              fit8 = { n=0, sum=0, max=0 },
@@ -2796,9 +2986,9 @@ track(RunService.RenderStepped:Connect(LPH_NO_VIRTUALIZE(function()
   end
   if not (trajVisible() and HUB.arc) then hideAll(); return end
   tf("drawn")
+  HUB.drawHidden = false
 
-  local a2 = predictArc(BALL.pos, BALL.vel, BALL.velSrc, BALL.stale, BALL.part,
-                        CFG.Traj.MapCheck)
+  local a2 = HUB.arcDraw
   local arc = (a2 and #a2 > 1) and a2 or HUB.arc.arc
   local hits = HUB.arc.hits
 
@@ -2815,20 +3005,34 @@ track(RunService.RenderStepped:Connect(LPH_NO_VIRTUALIZE(function()
   if not cam then hideAll() return end
   local col = hits and CFG.Traj.ColorIn or CFG.Traj.ColorOut
   local used = 0
+  -- КАЖДАЯ ТОЧКА ПРОЕЦИРОВАЛАСЬ ДВАЖДЫ.
+  -- Соседние отрезки делят вершину, а цикл звал WorldToViewportPoint и для
+  -- начала, и для конца: 126 вызовов вместо 64 на каждый кадр отрисовки.
+  -- Переносим результат предыдущего шага.
+  local sPrev, onPrev = cam:WorldToViewportPoint(arc[1].p)
   for i = 1, #arc-1 do
-    local s1, on1 = cam:WorldToViewportPoint(arc[i].p)
-    local s2, on2 = cam:WorldToViewportPoint(arc[i+1].p)
+    local sNext, onNext = cam:WorldToViewportPoint(arc[i+1].p)
     used += 1
     local l = mkLine(used)
     if l then
-      if on1 and on2 then
-        l.From = Vector2.new(s1.X, s1.Y)
-        l.To   = Vector2.new(s2.X, s2.Y)
-        l.Color = col; l.Visible = true
-      else l.Visible = false end
+      if onPrev and onNext then
+        l.From = Vector2.new(sPrev.X, sPrev.Y)
+        l.To   = Vector2.new(sNext.X, sNext.Y)
+        -- Цвет и видимость меняются раз в бросок, а писались каждый кадр в
+        -- каждую из полусотни линий. Запись в объект Drawing идёт через мост
+        -- исполнителя и стоит заметно дороже сравнения на стороне Lua.
+        local st = DRAWST[used]
+        if st ~= col then l.Color = col; l.Visible = true; DRAWST[used] = col end
+      elseif DRAWST[used] ~= false then
+        l.Visible = false; DRAWST[used] = false
+      end
     end
+    sPrev, onPrev = sNext, onNext
   end
-  for i = used+1, #lines do local l=lines[i]; if l then l.Visible=false end end
+  for i = used+1, #lines do
+    local l = lines[i]
+    if l and DRAWST[i] ~= false then l.Visible = false; DRAWST[i] = false end
+  end
 
   if CFG.Traj.Marks then
 
@@ -2855,6 +3059,245 @@ track(RunService.RenderStepped:Connect(LPH_NO_VIRTUALIZE(function()
   end
 end)))
 
+-- ВИЗУАЛЫ ЗОН И МАРШРУТА.
+-- Свой пул объектов Drawing, отдельный от траектории: тот индексируется
+-- точками дуги и перебирается целиком на каждый кадр. Экономия та же самая —
+-- объекты создаются ОДИН раз и переиспользуются, лишние просто прячутся, а
+-- каждая вершина проецируется на экран по одному разу, а не по два.
+local VZ = { lines = {}, texts = {}, nL = 0, nT = 0, cam = nil,
+  col = {
+    spoof   = Color3.fromRGB(255, 170,  40),   -- порог включения подмены
+    fake    = Color3.fromRGB(150, 100,  20),   -- куда подмена нас ставит
+    s3      = Color3.fromRGB( 80, 220, 255),   -- цель Smart 3PT
+    s3reach = Color3.fromRGB( 35, 110, 130),   -- откуда он ещё дотянет
+    slip    = Color3.fromRGB(255,  90, 160),   -- зона работы Contact Slip
+    rimfree = Color3.fromRGB(120, 255, 120),   -- у кольца курс не гнём
+    grab    = Color3.fromRGB( 90, 255, 140),
+    automove= Color3.fromRGB( 90, 190, 255),
+    defense = Color3.fromRGB(255, 210,  70),
+    anti    = Color3.fromRGB(255, 120, 120),
+    s3path  = Color3.fromRGB( 80, 220, 255),
+    other   = Color3.fromRGB(220, 220, 220),
+  } }
+
+function VZ.line()
+  VZ.nL += 1
+  -- Потолок на всякий случай: рисуем кругами, и если кто-то выкрутит
+  -- Smoothness вместе с пятью зонами, пул не должен расти без предела.
+  if VZ.nL > 420 then return nil end
+  local l = VZ.lines[VZ.nL]
+  if l == nil then
+    local ok, d = pcall(function()
+      local x = Drawing.new("Line")
+      x.Thickness = CFG.Vis.Thick; x.Transparency = 1
+      x.ZIndex = CFG.Traj.ZIndex; x.Visible = false
+      return x
+    end)
+    l = ok and d or false
+    VZ.lines[VZ.nL] = l
+  end
+  return l or nil
+end
+
+function VZ.textObj()
+  VZ.nT += 1
+  local t = VZ.texts[VZ.nT]
+  if t == nil then
+    local ok, d = pcall(function()
+      local x = Drawing.new("Text")
+      x.Size = 14; x.Center = true; x.Outline = true
+      x.Transparency = 1; x.ZIndex = CFG.Traj.ZIndex + 2
+      x.Visible = false
+      return x
+    end)
+    t = ok and d or false
+    VZ.texts[VZ.nT] = t
+  end
+  return t or nil
+end
+
+function VZ.hideFrom(nl, nt)
+  for i = nl + 1, #VZ.lines do
+    local l = VZ.lines[i]; if l then pcall(PBX.setVis, l, false) end
+  end
+  for i = nt + 1, #VZ.texts do
+    local t = VZ.texts[i]; if t then pcall(PBX.setVis, t, false) end
+  end
+end
+function VZ.hideAll() VZ.hideFrom(0, 0); VZ.nL, VZ.nT = 0, 0 end
+
+function VZ.seg(a, b, col, thick)
+  local cam = VZ.cam; if not cam then return end
+  local l = VZ.line(); if not l then return end
+  local s1, on1 = cam:WorldToViewportPoint(a)
+  local s2, on2 = cam:WorldToViewportPoint(b)
+  if on1 and on2 then
+    l.From = Vector2.new(s1.X, s1.Y)
+    l.To   = Vector2.new(s2.X, s2.Y)
+    l.Color = col
+    l.Thickness = thick or CFG.Vis.Thick
+    l.Visible = true
+  else
+    l.Visible = false
+  end
+end
+
+-- Круг на плоскости площадки. Точки проецируем по одной на вершину, а не по
+-- две на отрезок: при сорока сегментах это 41 вызов вместо 80.
+function VZ.ring(c, rad, col, y)
+  local cam = VZ.cam; if not (cam and rad and rad > 0.5) then return end
+  local n = math.clamp(math.floor(CFG.Vis.Segments), 8, 64)
+  local step = math.pi * 2 / n
+  local py = y or c.Y
+  local sPrev, onPrev = cam:WorldToViewportPoint(Vector3.new(c.X + rad, py, c.Z))
+  for i = 1, n do
+    local a = step * i
+    local s, on = cam:WorldToViewportPoint(
+      Vector3.new(c.X + math.cos(a) * rad, py, c.Z + math.sin(a) * rad))
+    local l = VZ.line()
+    if l then
+      if onPrev and on then
+        l.From = Vector2.new(sPrev.X, sPrev.Y)
+        l.To   = Vector2.new(s.X, s.Y)
+        l.Color = col; l.Thickness = CFG.Vis.Thick; l.Visible = true
+      else l.Visible = false end
+    end
+    sPrev, onPrev = s, on
+  end
+end
+
+function VZ.label(pos, str, col)
+  if not CFG.Vis.Labels then return end
+  local cam = VZ.cam; if not cam then return end
+  local t = VZ.textObj(); if not t then return end
+  local s, on = cam:WorldToViewportPoint(pos)
+  if on then
+    t.Position = Vector2.new(s.X, s.Y)
+    t.Text = str; t.Color = col; t.Visible = true
+  else t.Visible = false end
+end
+
+-- Дорожка как в Baritone: сплошная линия плюс шевроны по ходу движения.
+-- Шеврон рисуется двумя отрезками назад-в-стороны от точки на маршруте, так
+-- что направление читается с любого ракурса.
+function VZ.arrows(from, to, col, y)
+  local d = (to - from) * FLAT
+  local len = d.Magnitude
+  if len < 0.6 then return end
+  local u = d.Unit
+  local a = Vector3.new(from.X, y, from.Z)
+  local b = Vector3.new(to.X, y, to.Z)
+  VZ.seg(a, b, col, CFG.Vis.Thick + 1)
+  local right = Vector3.new(-u.Z, 0, u.X)
+  local at, guard = 2.5, 0
+  while at < len and guard < 32 do
+    guard += 1
+    local p = a + u * at
+    VZ.seg(p, p - u * 1.5 + right * 0.95, col)
+    VZ.seg(p, p - u * 1.5 - right * 0.95, col)
+    at += 3.0
+  end
+  -- метка самой цели: маленький крест, чтобы точка была видна и вплотную
+  VZ.seg(b - right * 1.1, b + right * 1.1, col)
+  VZ.seg(b - u * 1.1, b + u * 1.1, col)
+  VZ.seg(b, b + Vector3.new(0, 2.2, 0), col)
+end
+
+function VZ.ownerColor(o)
+  return VZ.col[o] or VZ.col.other
+end
+
+-- Что скрипт СЕЙЧАС делает — берём объяснение того владельца, который рулит.
+function VZ.ownerWhy(o)
+  if o == "grab" then return HUB.grabWhy or HUB.blockWhy
+  elseif o == "automove" then return HUB.autoWhy
+  elseif o == "defense" then return HUB.defWhy or "guarding"
+  elseif o == "anti" then return HUB.antiShot
+  elseif o == "s3" then return HUB.s3Why end
+  return nil
+end
+
+track({ Disconnect = function() pcall(VZ.hideAll) end })
+track(RunService.RenderStepped:Connect(function()
+  local V = CFG.Vis
+  if not (HUB.running and Drawing and (V.Zones or V.Path)) then
+    if VZ.nL > 0 or VZ.nT > 0 then pcall(VZ.hideAll) end
+    return
+  end
+  local cam = Workspace.CurrentCamera
+  if not cam then pcall(VZ.hideAll); return end
+  VZ.cam, VZ.nL, VZ.nT = cam, 0, 0
+
+  local me = selfPos()
+  -- Пол площадки: lastValidHeight у игры это высота, на которую она сама
+  -- ставит персонажа. Если её нет — берём свои ноги.
+  local gy = (groundLevel() or ((me and me.Y or 0) - 3)) + 0.15
+
+  if V.Zones then
+    local hp = me and nearestHoop(me) or nil
+    if hp then
+      if CFG.Spoof.Enabled then
+        -- Дальше этой черты подмена дистанции включается, ближе — молчит.
+        VZ.ring(hp, CFG.Spoof.MinRealDist, VZ.col.spoof, gy)
+        VZ.label(hp + Vector3.new(0, 2.5, -CFG.Spoof.MinRealDist),
+          ("spoof from %.0f stds"):format(CFG.Spoof.MinRealDist), VZ.col.spoof)
+        -- И куда она нас ставит на регистрации.
+        VZ.ring(hp, CFG.Spoof.FakeDist, VZ.col.fake, gy)
+        VZ.label(hp + Vector3.new(0, 1.5, -CFG.Spoof.FakeDist),
+          ("shown at %.0f"):format(CFG.Spoof.FakeDist), VZ.col.fake)
+      end
+      if CFG.S3.Enabled then
+        -- Цель: линия плюс поля безопасности, ровно как в расчёте броска.
+        local need = CFG.S3.LineDist + 0.95 + CFG.S3.Extra
+        VZ.ring(hp, need, VZ.col.s3, gy)
+        VZ.label(hp + Vector3.new(need, 2.5, 0),
+          ("3pt target %.1f"):format(need), VZ.col.s3)
+        -- И откуда он ещё дотянет: ближе этого кольца уже не вытащит.
+        local from = need - CFG.S3.Window
+        if from > 1 then
+          VZ.ring(hp, from, VZ.col.s3reach, gy)
+          VZ.label(hp + Vector3.new(from, 1.5, 0),
+            ("reach from %.1f"):format(from), VZ.col.s3reach)
+        end
+      end
+      if CFG.Move.Slip.Enabled and CFG.Move.RimFree > 0 then
+        -- Внутри этого круга курс не гнём вообще, чтобы разгон в данк уцелел.
+        VZ.ring(hp, CFG.Move.RimFree, VZ.col.rimfree, gy)
+      end
+    end
+    if CFG.Move.Slip.Enabled and me then
+      -- Зона работы обхода. В режиме Feint это радиус, с которого он вообще
+      -- начинает читать соперников; в Default — радиус контакта, помноженный
+      -- на Start Distance, то есть расстояние, с которого начинается увод.
+      local S = CFG.Move.Slip
+      local r = (S.Mode == "Feint") and S.ReactRadius or (2.0 * 1.2 * S.StartMul)
+      VZ.ring(me, r, VZ.col.slip, gy)
+      VZ.label(me + Vector3.new(0, 2.5, -r),
+        ("slip %s %.1f"):format(tostring(S.Mode), r), VZ.col.slip)
+    end
+  end
+
+  if V.Path and me then
+    local fresh = HUB.navAt and (os.clock() - HUB.navAt) < 0.35
+    local owner = fresh and HUB.navOwner or nil
+    if owner then
+      local col = VZ.ownerColor(owner)
+      local goal = HUB.navGoal
+      if not goal and typeof(HUB.navDir) == "Vector3" and HUB.navDir.Magnitude > 0.1 then
+        goal = me + HUB.navDir.Unit * 10
+      end
+      if goal then
+        VZ.arrows(me, goal, col, gy)
+        local why = VZ.ownerWhy(owner)
+        VZ.label(Vector3.new(goal.X, gy + 3.2, goal.Z),
+          why and (owner .. ": " .. tostring(why)) or owner, col)
+      end
+    end
+  end
+
+  VZ.hideFrom(VZ.nL, VZ.nT)
+end))
+
 function PBX.predSlack(tAhead)
   local q = HUB.predQ and HUB.predQ.shot
 
@@ -2867,8 +3310,13 @@ local function pickInterceptPoint(info, opt)
 
   local needFit = opt.fitN or CFG.Traj.MinFitN
   if (info.fitN or 0) < needFit then
-    return nil, nil, nil, ("fit not converged yet (%d/%d points)")
-      :format(info.fitN or 0, needFit)
+    -- ПРИЧИНЫ ТЕПЕРЬ КОНСТАНТЫ, А ЧИСЛА ЛЕЖАТ РЯДОМ.
+    -- Каждый отказ раньше собирал новую строку через string.format, а по
+    -- воронке в дампе только одна из веток набрала 30356 срабатываний за
+    -- сессию — это тридцать тысяч мусорных строк с шестью аргументами
+    -- форматирования. Текст для человека собирается один раз, при выгрузке.
+    HUB.gateFit = { have = info.fitN or 0, need = needFit }
+    return nil, nil, nil, "fit not converged yet"
   end
   if opt.skipOwn and info.shooter then
     if info.shooter == chr() then return nil, nil, nil, "our own shot" end
@@ -2900,12 +3348,21 @@ local function pickInterceptPoint(info, opt)
   local tol   = (opt.rad or 6) + slack
   HUB.lastHoopTol, HUB.lastHoopT = tol, tAt
   if not bi or (bd or 1e9) > tol then
-    return nil, bd, gp,
-      ("ball not heading to hoop: closest to %s %.1f > %.1f (base %.1f + pred slack %.1f at %.2fs)")
-        :format(scope, bd or -1, tol, opt.rad or 6, slack, tAt)
+    HUB.gateMiss = { scope = scope, d = bd, tol = tol,
+                     rad = opt.rad or 6, slack = slack, at = tAt }
+    return nil, bd, gp, "ball not heading to hoop"
   end
   return bi, bd, gp, nil
 end
+
+-- Ключи воронки для PBX.gs: раньше здесь на каждый кадр выполнялся
+-- tostring(why):gsub(":.*",""):sub(1,40), то есть регулярка плюс три строки.
+-- Теперь конкатенация случается ОДИН раз на каждую уникальную причину.
+PBX.GATEKEY = setmetatable({}, { __index = function(t, k)
+  local v = "gate: " .. tostring(k)
+  rawset(t, k, v)
+  return v
+end })
 
 local function ourSpeed()
   local ws = sAttr(chr(), "WalkSpeed")
@@ -3107,6 +3564,30 @@ function JP.bodyRise(dy)
   return JP.riseTo(math.max((dy or 0) - CFG.Grab.ArmReach, 0))
 end
 
+-- КОГДА МЯЧ ВОЙДЁТ В ЗОНУ ХВАТА — ПО НАСТОЯЩЕЙ ТРАЕКТОРИИ.
+-- Прежний расчёт делил расстояние на ГОРИЗОНТАЛЬНУЮ скорость сближения. У
+-- мяча, падающего почти отвесно, она около нуля, а деление на неё давало
+-- бесконечность: ранний прыжок не срабатывал НИКОГДА, и оставалась только
+-- ветка "мяч уже рядом" с упреждением ноль. В журнале это записи с
+-- wantLead = 0 — решение принимается, когда лететь уже некуда, и при лаге
+-- прыжка 0.36 с мы гарантированно опаздывали. Считаем шагами: мяч падает по
+-- гравитации, мы бежим по горизонтали, ищем первый момент касания зоны.
+function JP.timeToReach(bp, bvel, me, myV, radius, maxT)
+  if not (bp and me) then return nil end
+  local g = Vector3.new(0, -Workspace.Gravity, 0)
+  local zero = Vector3.new()
+  bvel = (typeof(bvel) == "Vector3") and bvel or zero
+  myV  = (typeof(myV)  == "Vector3") and (myV * FLAT) or zero
+  local step, t = 1/30, 0
+  while t <= maxT do
+    local q = bp + bvel*t + g*(0.5*t*t)
+    local p = me + myV*t
+    if (q - p).Magnitude <= radius then return t, q end
+    t = t + step
+  end
+  return nil
+end
+
 function JP.jumpLead(dy)
   local ping = dataPing()
   local lag = HUB.jumpLag or (CFG.Grab.JumpLagFallback * ping)
@@ -3190,7 +3671,8 @@ end
 local SLIP = { Cone = 0.90, juke = { phase = nil, until_ = 0, doneAt = 0 } }
 
 local SLIPLOG = {}
-local slipPrev = {}
+-- Тоже переехало из верхнего локала: слот в чанке нужнее.
+SLIP.prev = {}
 local function slipWatch()
   local nowW = os.clock()
   if nowW - (SLIP.watchAt or 0) < 0.05 then return end
@@ -3204,8 +3686,8 @@ local function slipWatch()
     ldd  = tostring(sAttr(c, "LastDribbleDirection")),
   }
   for k, v in pairs(cur) do
-    if slipPrev[k] ~= v then
-      slipPrev[k] = v
+    if SLIP.prev[k] ~= v then
+      SLIP.prev[k] = v
 
       -- Этот цикл стоял ВНУТРИ перебора изменившихся атрибутов, то есть
       -- пересчитывал одно и то же по разу на каждый атрибут. Берём готовый
@@ -3791,6 +4273,12 @@ local function steerToDir(dir, sprint, owner, silent)
     HUB.moveNeedInput = (owner == "defense") and (CFG.Defense.Mode == "Hook")
     HUB.moveSrc = tostring(HUB.pmSrc)
     HUB.cmdDir, HUB.cmdAt = dir, os.clock()
+    -- СЛЕД ДЛЯ ВИЗУАЛА МАРШРУТА.
+    -- Здесь известно только НАПРАВЛЕНИЕ; конкретную точку, если она есть,
+    -- дописывает steerTo сразу после вызова. Владелец и время нужны, чтобы
+    -- стрелки гасли сами, когда рулить перестали.
+    HUB.navGoal, HUB.navDir = nil, dir
+    HUB.navOwner, HUB.navAt = owner or "?", os.clock()
   else
     HUB.moveSrc = "remote only: " .. tostring(HUB.pmSrc)
   end
@@ -3805,9 +4293,7 @@ local function steerToDir(dir, sprint, owner, silent)
     end
 
     if sprint ~= HUB.sprintOn then
-      HUB.bypass = true
-      pcall(Mt.FireServer, R.Sprint, sprint and true or false)
-      HUB.bypass = false
+      PBX.sprintSend(sprint)
       HUB.sprintOn = sprint and true or false
     end
     HUB.steering = true
@@ -3818,6 +4304,7 @@ function stopSteerSoft(owner)
   if owner and HUB.moveOwner and HUB.moveOwner ~= owner then return end
   HUB.moveWorld, HUB.moveAt, HUB.moveOwner = nil, nil, nil
   HUB.moveNeedInput = nil
+  HUB.navGoal, HUB.navDir, HUB.navOwner = nil, nil, nil
 end
 
 track(RunService.Heartbeat:Connect(function()
@@ -3849,15 +4336,23 @@ track(RunService.Heartbeat:Connect(function()
   end
 end))
 
+-- ЭТОТ ТИК — ЧИСТАЯ ДИАГНОСТИКА ЗАСТРЕВАНИЯ, И ОН СТОИЛ КАДРА.
+-- Каждый кадр он создавал НОВОЕ ЗАМЫКАНИЕ ради одного чтения скорости
+-- (анонимная функция в pcall захватывает hrp апвэлью — это аллокация), плюс
+-- FindFirstChild, чтение Position и трёх атрибутов. Замыкание убрано, сам
+-- опрос стоит десять раз в секунду: застревание длится секундами, увидим.
 track(RunService.Heartbeat:Connect(function()
+  if os.clock() - (HUB.stuckAt or 0) < 0.1 then return end
+  HUB.stuckAt = os.clock()
   local c = chr(); if not c then return end
   local m = HUB.mov
   local want = m and rawget(m, "MoveDirection")
   local hrp = sChild(c, "HumanoidRootPart")
-  local vel = hrp and posOf(hrp) and (function()
-    local ok, v = pcall(RDR.AssemblyLinearVelocity, hrp)
-    return ok and v or nil
-  end)() or nil
+  local vel = nil
+  if hrp then
+    local okv, v = pcall(RDR.AssemblyLinearVelocity, hrp)
+    if okv then vel = v end
+  end
   local wantMag = (typeof(want)=="Vector3") and want.Magnitude or 0
   local velMag = vel and (vel*FLAT).Magnitude or 0
   if wantMag > 0.3 and velMag < 1.5 and sAttr(c, "CanMove") ~= false then
@@ -3882,12 +4377,14 @@ local function steerTo(pt, owner)
   local d = (pt - me) * FLAT
   if d.Magnitude < 1 then stopSteerSoft(owner); return end
   steerToDir(d.Unit, CFG.Grab.Sprint and true or false, owner)
+  HUB.navGoal = pt
 end
 
 local function stopSteer(owner)
   if owner and HUB.moveOwner and HUB.moveOwner ~= owner then return end
   HUB.moveWorld, HUB.moveAt, HUB.moveOwner = nil, nil, nil
   HUB.moveNeedInput = nil
+  HUB.navGoal, HUB.navDir, HUB.navOwner = nil, nil, nil
   HUB.defDir = nil
   if not HUB.steering then return end
   HUB.steering = nil
@@ -3904,11 +4401,11 @@ local function stopSteer(owner)
   if HUB.sprintAuto then wantSprint = true end
   HUB.bypass = true
   pcall(Mt.FireServer, R.Move, real)
+  HUB.bypass = false
   if HUB.sprintOn ~= wantSprint then
-    pcall(Mt.FireServer, R.Sprint, wantSprint)
+    PBX.sprintSend(wantSprint)
     HUB.sprintOn = wantSprint
   end
-  HUB.bypass = false
 end
 
 function PBX.probe()
@@ -4058,22 +4555,15 @@ function PBX.legitStep(g, hp)
 
   local t0 = os.clock()
 
-  -- ДРИББЛ-ОТХОД. Keyboard_ModuleScript:51 шлёт Dribble:Fire(combo, sprint,
-  -- lastMoveDirection), а Dribbling_ModuleScript.Input сопоставляет комбинации
-  -- ходам: "X" это StepBack на обе руки, ровно разрыв дистанции. Шлём ОДИН раз
-  -- и ДО того, как уйдёт пакет броска: во время замаха любой ввод меняет тип
-  -- гатера, этому мы уже научились на спринте.
-  if A.Dribble and R.Drib and not PBX.shotBusy() then
-    if (os.clock() - (HUB.antiDribAt or 0)) > A.DribbleCD then
-      HUB.antiDribAt = os.clock()
-      local away = (startPos - foe0) * FLAT
-      away = (away.Magnitude > 0.1) and away.Unit or Vector3.new(0,0,1)
-      HUB.bypass = true
-      pcall(Mt.FireServer, R.Drib, A.DribbleCombo, false, away)
-      HUB.bypass = false
-      HUB.antiDrib = ("dribble %s away"):format(tostring(A.DribbleCombo))
-    end
-  end
+  -- ДРИББЛ-ОТХОД ОТСЮДА УБРАН, И ВОТ ПОЧЕМУ ОН НИКОГДА НЕ СРАБАТЫВАЛ.
+  -- Здесь стояло условие "A.Dribble and R.Drib and not PBX.shotBusy()".
+  -- Но legitStep вызывается из spoofShot, а тот — из хука на Shoot, где
+  -- строкой выше выставлен HUB.shotPressAt. PBX.shotBusy() читает именно его
+  -- и держит true целый пинг плюс 0.6 с. То есть на входе в эту функцию
+  -- shotBusy ВСЕГДА истина, и ветка была мёртвой с первого дня.
+  -- Убрать проверку нельзя: во время замаха любой ввод меняет тип гатера и
+  -- рвёт бросок. Значит место у дриббла другое — он теперь живёт своим тиком
+  -- (ниже по файлу) и работает, пока мяч у нас и броска НЕТ.
 
   -- BACKTP: то же, что Legit, но одним шагом.
   -- Цель считается той же парой React/StopAt, просто вместо ходьбы ставим
@@ -4133,6 +4623,107 @@ function PBX.legitStep(g, hp)
   HUB.antiShot = ("retreat: gap %.1f -> %.1f, moved %.1f stds (%.0f ms)")
     :format(gap0, gap or gap0, walked, (os.clock()-t0)*1000)
   return walked, gap, "retreat"
+end
+
+-- ДРИББЛ-ОТХОД — САМОСТОЯТЕЛЬНАЯ ФИЧА, А НЕ ЧАСТЬ БРОСКА.
+-- Keyboard_ModuleScript:51 шлёт InputService.Dribble:Fire(combo, sprintHeld,
+-- lastMoveDirection), Dribbling_ModuleScript.Input сопоставляет комбинации
+-- ходам: X это StepBack на обе руки, ровно разрыв дистанции.
+-- Работает, пока мяч у нас и броска НЕТ: во время замаха любой ввод меняет
+-- тип гатера и обрывает удар — именно поэтому внутри legitStep эта ветка
+-- стояла под shotBusy и не выполнялась ни разу.
+track(RunService.Heartbeat:Connect(function()
+  local A = CFG.AntiDef
+  if not (HUB.running and A.Enabled and A.Dribble and R.Drib) then
+    HUB.antiDrib = nil; return
+  end
+  if not hasBall(chr()) then HUB.antiDrib = "no ball in hand"; return end
+  if PBX.shotBusy() then HUB.antiDrib = "shot in progress, input would cancel it"; return end
+  if sAttr(chr(), "Stunned") == true then HUB.antiDrib = "stunned"; return end
+  if os.clock() - (HUB.antiDribAt or 0) < A.DribbleCD then return end
+
+  local me = selfPos(); if not me then return end
+  local foe, best = nil, nil
+  local pool, np = foeSnap()
+  for i = 1, np do
+    local e = pool[i]
+    local r = ((e.p - me) * FLAT).Magnitude
+    -- держащий стойку опаснее: тот же вес, что у отшага
+    local d = r / ((A.Stance and e.g) and A.StanceWeight or 1)
+    if not best or d < best then foe, best = e.p, d end
+  end
+  if not foe then HUB.antiDrib = "nobody near"; return end
+  if best > A.React then
+    HUB.antiDrib = ("nearest %.1f stds, triggers under %.0f"):format(best, A.React)
+    return
+  end
+
+  HUB.antiDribAt = os.clock()
+  -- Игра передаёт lastMoveDirection — СЫРОЙ ввод игрока (Movement:184), он
+  -- цел даже когда MoveDirection уже подменён игрой или нами.
+  local dir = Vector3.new()
+  local m = HUB.mov
+  if m then
+    local okr, raw = pcall(RDR.lastMoveDirection, m)
+    if okr and typeof(raw) == "Vector3" then dir = raw end
+  end
+  if dir.Magnitude < 0.05 then
+    local away = (me - foe) * FLAT
+    dir = (away.Magnitude > 0.1) and away.Unit or Vector3.new(0,0,1)
+  end
+  local sprint = false
+  pcall(function() sprint = UIS:IsKeyDown(Enum.KeyCode.LeftShift) end)
+  HUB.bypass = true
+  local ok = pcall(Mt.FireServer, R.Drib, A.DribbleCombo, sprint, dir)
+  HUB.bypass = false
+  HUB.antiDribN = (HUB.antiDribN or 0) + 1
+  HUB.antiDrib = ok
+    and ("%s fired at %.1f stds (x%d)"):format(tostring(A.DribbleCombo), best, HUB.antiDribN)
+    or "the Dribble remote refused"
+end))
+
+-- SMART 3PT, РЕЖИМ LEGIT: ОТХОДИМ ЗА ДУГУ НОГАМИ.
+-- Телепорт показывает серверу чужую точку — быстро и надёжно, но это подмена.
+-- Legit уводит по-настоящему: сервер видит НАСТОЯЩУЮ дистанцию, и подменять
+-- нечего, тройка честная. Способ движения тот же, что у отшага Anti Defense,
+-- и по той же причине: на броске сервер ставит CanMove = false, игровая ветка
+-- скорости выходит ранним return (Base:236), поэтому скорость мы пишем сами
+-- в MovementVelocity. Move и Sprint на сервер при этом НЕ шлём: любой ввод
+-- посреди замаха читается игрой как смена типа гатера и рвёт удар.
+function PBX.s3Step(g, hp, need)
+  local S = CFG.S3
+  if not (hp and need and S.StepTime > 0) then return end
+  local t0 = os.clock()
+  if S.Speed and S.Speed > 0 then
+    HUB.antiSpeed = S.Speed
+    HUB.antiSpeedUntil = t0 + S.StepTime + 0.1
+  end
+  local got, moved = nil, 0
+  local start = selfPos()
+  while HUB.running and HUB.gen == g and os.clock() - t0 < S.StepTime do
+    -- ОТШАГ ANTI DEFENSE ГЛАВНЕЕ: он убирает контест, а контест портит бросок
+    -- сильнее, чем недобранный студ до дуги. Ждём, пока тот отработает.
+    if HUB.moveOwner == "anti" then RunService.Heartbeat:Wait(); continue end
+    local mp = selfPos(); if not mp then break end
+    local away = (mp - hp) * FLAT
+    got = away.Magnitude
+    if got >= need then break end
+    away = (got > 0.1) and away.Unit or Vector3.new(0, 0, 1)
+    -- Тот же флаг «мы реально идём»: пока он поднят, подмена позиции в
+    -- spoofShot не вызывает tpProxy и не стирает уход.
+    HUB.antiStepUntil = os.clock() + 0.05
+    HUB.antiDir = away
+    steerToDir(away, false, "s3", true)
+    RunService.Heartbeat:Wait()
+  end
+  stopSteerSoft("s3")
+  HUB.antiStepUntil, HUB.antiDir = nil, nil
+  HUB.antiSpeed, HUB.antiSpeedUntil = nil, nil
+  local ep = selfPos()
+  if start and ep then moved = ((ep - start) * FLAT).Magnitude end
+  local final = (ep and hp) and ((ep - hp) * FLAT).Magnitude or (got or -1)
+  HUB.s3Walk = ("walked out to %.1f of %.1f needed (%.1f stds, %.0f ms)")
+    :format(final, need, moved, (os.clock() - t0) * 1000)
 end
 
 function PBX.antiTest()
@@ -4311,11 +4902,15 @@ function PBX.arcEffOf(c, dist)
   return math.clamp(ae, CFG.Grab.ArcEffMin, CFG.Grab.ArcEffMax), rel
 end
 
-local fsaCache, fsaAt = {}, 0
+local fsaCache, fsaFrame = {}, -1
 local function futureShotArc(c)
   if not c then return nil end
-  local now0 = os.clock()
-  if now0 - fsaAt > 0.03 then fsaCache = {}; fsaAt = now0 end
+  -- КЭШ НА КАДР, А НЕ НА 0.03 СЕКУНДЫ.
+  -- Внутри PBX.march на 64 шага с рейкастами, и зовут её четыре независимых
+  -- тика (взгляд на мяч, бюджет угрозы, охрана кольца, ранний подбор). Порог
+  -- 0.03 с больше кадра (1/60 = 0.0167), поэтому марш пересчитывался по два
+  -- раза за кадр вместо одного. Ключ — номер кадра, промахов больше нет.
+  if fsaFrame ~= HUB.frame then table.clear(fsaCache); fsaFrame = HUB.frame end
   local hit = fsaCache[c]
   if hit ~= nil then return hit or nil end
   local sst = sAttr(c, "ShotStartTime")
@@ -4569,7 +5164,9 @@ track(RunService.Heartbeat:Connect(function(dt)
   faceBall(me + look * 10, dt, CFG.Face.Rate, CFG.Face.Smooth)
 end))
 
-local G2_lastSteal = 0
+-- Счётчик кулдауна перехвата мяча жил отдельным верхним локалом. В чанке
+-- Luau их всего 200, и место дороже: кладём в HUB, там ему и место.
+HUB.g2Steal = 0
 
 local function threatBudget(carrier)
 
@@ -4758,8 +5355,8 @@ track(RunService.Heartbeat:Connect(function(dt)
       end
     end
     if M2.Steal and CFG.Defense.Enabled and R.Steal and near <= M2.StealRad
-       and os.clock() - G2_lastSteal >= M2.StealCD then
-      G2_lastSteal = os.clock()
+       and os.clock() - (HUB.g2Steal or 0) >= M2.StealCD then
+      HUB.g2Steal = os.clock()
       HUB.bypass = true
       pcall(Mt.FireServer, R.Steal)
       HUB.bypass = false
@@ -4827,8 +5424,8 @@ local function guardOnArc(arc, me, tMax, tOffset, label, dt, ballPart)
   end
   local tTotal = tc + (tOffset or 0)
   local lead = JP.jumpLead(dy)
-  HUB.grabWhy = ("%s: %.1f stds, dy %+.1f, in %.0f ms, jump at %.0f ms")
-    :format(label, dxz, dy, tTotal*1000, lead*1000)
+  PBX.why("grabWhy", "%s: %.1f stds, dy %+.1f, in %.0f ms, jump at %.0f ms",
+          label, dxz, dy, tTotal*1000, lead*1000)
   if tTotal <= lead then
     PBX.gs("jumped", dy)
     local ball = ballPart and (ballTrueNow(posOf(ballPart), BALL.vel, BALL.stale)) or pc
@@ -4888,8 +5485,7 @@ local function rimGuardTick(dt)
   })
   if not hi then
     HUB.grabWhy = why
-
-    PBX.gs("gate: " .. tostring(why):gsub(":.*", ""):sub(1, 40), HUB.lastHoopDist)
+    PBX.gs(PBX.GATEKEY[why], HUB.lastHoopDist)
     return false
   end
   PBX.gs("gate passed")
@@ -4970,8 +5566,8 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
 
                 steerTo(cp, "grab")
                 faceBall(cp, dt)
-                HUB.blockWhy = ("rim attack: %s at %.1f from hoop, closing %.1f")
-                  :format(tostring(sAttr(c, "Action")), toHoop, toUs)
+                PBX.why("blockWhy", "rim attack: %s at %.1f from hoop, closing %.1f",
+                        tostring(fe.act), toHoop, toUs)
                 PBX.gs("rim attack closing", toUs)
                 return
               end
@@ -5014,36 +5610,29 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
               -- Считаем, когда мяч ВОЙДЁТ в зону хвата, и прыгаем на величину
               -- упреждения раньше.
               if BALL.vel and (os.clock() - (HUB.lastJump or 0)) >= CFG.Grab.JumpCD then
-                -- СКОРОСТЬ СБЛИЖЕНИЯ, А НЕ ОДНА ЛИШЬ СКОРОСТЬ МЯЧА.
-                -- Первая версия делила ТРЁХМЕРНУЮ дистанцию на ГОРИЗОНТАЛЬНУЮ
-                -- скорость мяча и не учитывала, что мы к нему сами бежим. В
-                -- журнале это прыжки с упреждением 470..637 мс, у которых мяч
-                -- приходил на полсекунды позже (arrErr от -461 до -557): мы
-                -- взлетали и успевали приземлиться до его прилёта. Считаем по
-                -- горизонтали и складываем обе скорости.
-                local toB = (bp - me) * FLAT
-                if toB.Magnitude > 0.1 then
-                  local u = toB.Unit
-                  local ballIn = -((BALL.vel * FLAT):Dot(u))
-                  local myV = charVel(chr())
-                  local meIn = (typeof(myV) == "Vector3") and ((myV * FLAT):Dot(u)) or 0
-                  local closing = ballIn + meIn
-                  if closing > 1 then
-                    local tIn  = (toB.Magnitude - CFG.Grab.RimCatchJump) / closing
-                    local lead = JP.jumpLead(dyB)
-                    if tIn > 0 and tIn <= lead then
-                      HUB.blockWhy = ("rim catch: jumping %.0f ms early, ball in %.0f ms")
-                        :format(lead*1000, tIn*1000)
-                      PBX.gs("rim catch jump early", tIn)
-                      doJump(HUB.blockWhy, bp, dt, bp, tIn, dyB)
-                      return
-                    end
-                  end
+                -- ВРЕМЯ ВХОДА В ЗОНУ ХВАТА СЧИТАЕМ ПО ТРАЕКТОРИИ, А НЕ ДЕЛЕНИЕМ.
+                -- Подробности в JP.timeToReach: отвесно падающий мяч имел
+                -- нулевую горизонтальную скорость сближения и ранний прыжок
+                -- не запускался вовсе.
+                local lead = JP.jumpLead(dyB)
+                local myV = charVel(chr())
+                local dirNow = HUB.moveWorld
+                if typeof(dirNow) == "Vector3" and dirNow.Magnitude > 0.1 then
+                  myV = dirNow.Unit * ourSpeed()
+                end
+                local tIn = JP.timeToReach(bp, BALL.vel, me, myV,
+                                           CFG.Grab.RimCatchJump, lead + 0.35)
+                if tIn and tIn <= lead then
+                  HUB.blockWhy = ("rim catch: jumping %.0f ms early, ball in %.0f ms")
+                    :format(lead*1000, tIn*1000)
+                  PBX.gs("rim catch jump early", tIn)
+                  doJump(HUB.blockWhy, bp, dt, bp, tIn, dyB)
+                  return
                 end
               end
               steerTo(bp, "grab")
               faceBall(bp, dt)
-              HUB.blockWhy = ("rim catch: closing on ball %.1f from hoop"):format(bH)
+              PBX.why("blockWhy", "rim catch: closing on ball %.1f from hoop", bH)
               PBX.gs("rim catch closing", bU)
               return
             end
@@ -5115,13 +5704,9 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
         elseif HUB.shootAt[c] then
           elapsed, tsrc = os.clock() - HUB.shootAt[c], "local"
         end
-        HUB.theirMeter = (function()
-          local mv = sAttr(c, "meterOffset")
-          if typeof(mv)=="Vector2" then
-            local ax,ay = math.abs(mv.X), math.abs(mv.Y); return (ay>ax) and ay or ax
-          elseif type(mv)=="number" then return math.abs(mv) end
-          return nil
-        end)()
+        -- Здесь стояло анонимное замыкание, вызываемое на месте: новая функция
+        -- в куче на каждый кадр, пока соперник целится. Вынесено наверх.
+        HUB.theirMeter = PBX.meterOf(c)
         untilRelease = elapsed and (CFG.Grab.ShootTime - elapsed) or nil
         if untilRelease then
 
@@ -5145,10 +5730,12 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
           local distAt = math.min(distNow,
                                   ((himAt - meAt) * FLAT).Magnitude)
           local reach  = distAt <= CFG.Grab.BlockRange
-          HUB.blockWhy = ("%s: shooting %.0f ms, release in %.0f ms, lead %.0f ms (lag %s), dist %.1f/%.1f")
-            :format(tostring(tsrc), (elapsed or 0)*1000, untilRelease*1000, lead*1000,
-                    HUB.jumpLag and ("%.0f ms"):format(HUB.jumpLag*1000) or "estimate",
-                    distAt, distNow)
+          if PBX.whyDue("blockWhy") then
+            HUB.blockWhy = ("%s: shooting %.0f ms, release in %.0f ms, lead %.0f ms (lag %s), dist %.1f/%.1f")
+              :format(tostring(tsrc), (elapsed or 0)*1000, untilRelease*1000, lead*1000,
+                      HUB.jumpLag and ("%.0f ms"):format(HUB.jumpLag*1000) or "estimate",
+                      distAt, distNow)
+          end
           local conesOk = (not CFG.Grab.UseCones) or (not inRange) or (onLine and facing)
 
           local committed = (elapsed or 0) >= CFG.Grab.MinCommit
@@ -5394,8 +5981,8 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
     return
   end
 
-  HUB.grabWhy = ("catch in %.0f ms, %.1f stds away, dy %+.1f")
-    :format(pickT * 1000, pickRun, pickDy)
+  PBX.why("grabWhy", "catch in %.0f ms, %.1f stds away, dy %+.1f",
+          pickT * 1000, pickRun, pickDy)
 
   -- ЦЕЛЬ ХОДЬБЫ СМЕЩАЕМ ВПЕРЁД ПО ДУГЕ, А ЦЕЛЬ ВЗГЛЯДА ОСТАВЛЯЕМ НА МЯЧЕ.
   -- Смотрим туда, где мяч будет в момент хвата, но ногами идём чуть дальше:
@@ -5462,42 +6049,64 @@ local function guardSpot(target, me)
   local goal = goalPosOf(target) or defendGoalPos(target); if not goal then return nil end
 
   local vel = charVel(target)
-
   local flatT, flatG = tp*FLAT, goal*FLAT
   if (flatG-flatT).Magnitude < 0.1 then return nil end
-  local cf = CFrame.new(flatT, flatG)
-
   local act = sAttr(target, "Action")
-  local latK = (act == "Dribbling") and D.LeadLatDrib or D.LeadLat
-  local lat  = cf.RightVector:Dot(vel) * latK
-  local fwd  = cf.LookVector:Dot(vel) * D.LeadFwd
-  local stand = (PBX.SHOT_PROJ[act] or PBX.SHOT_RIM[act]) and D.StandShoot or D.StandBase
 
-  local dT = (flatT - flatG).Magnitude
+  -- УПРЕЖДЕНИЕ СДВИГАЕТ ЕГО, А НЕ НАС. ЭТО И БЫЛА ПРИЧИНА СМЕЩЕНИЯ ВБОК.
+  -- Точка защиты считалась от его ТЕКУЩЕЙ позиции, а поперечная скорость
+  -- добавлялась отдельным слагаемым RightVector * (боковая скорость * 0.2).
+  -- При ведении вбок на 14 стд/с это 2.8 студа В СТОРОНУ ОТ ЛИНИИ «он —
+  -- кольцо», причём симметрично в обе стороны: влево, когда он идёт влево,
+  -- вправо, когда вправо. Ровно то, что видно в игре — «скрипт где-то
+  -- левее или правее, а не перед ним».
+  -- Правильно так: предсказать, ГДЕ ОН БУДЕТ, и заново построить линию из
+  -- этой точки на кольцо. Тогда мы на линии при любом упреждении.
+  local leadT = (act == "Dribbling") and D.LeadLatDrib or D.LeadLat
+  local flatV = Vector3.new(vel.X, 0, vel.Z)
+  local pred = flatT + flatV * math.clamp(leadT, 0, 0.6)
+  local off = pred - flatT
+  if off.Magnitude > D.LeadMax then pred = flatT + off.Unit * D.LeadMax end
+
+  local toGoal = flatG - pred
+  if toGoal.Magnitude < 0.1 then return nil end
+  local u = toGoal.Unit
+
+  local stand = (PBX.SHOT_PROJ[act] or PBX.SHOT_RIM[act]) and D.StandShoot or D.StandBase
+  -- Разгоняется прямо на кольцо — отступаем дальше ПО ТОЙ ЖЕ ЛИНИИ, а не вбок.
+  local closing = (flatV.Magnitude > 0.01) and u:Dot(flatV) or 0
+  if closing > 0 then stand = stand + closing * D.LeadFwd end
+
+  local dT = toGoal.Magnitude
   local dU = ((me*FLAT) - flatG).Magnitude
-  local ahead = dT < dU
+  local behind = dT < dU          -- он ближе к кольцу, чем мы: нас обошли
   local gap = math.abs(dU - dT)
 
   local blowby = false
-  if vel.Magnitude > 0.01 and cf.LookVector:Dot(vel.Unit) > D.BlowbyDot then
-    blowby = vel.Magnitude > D.BlowbySpeed and gap < D.BlowbyGap
+  if flatV.Magnitude > 0.01 and u:Dot(flatV.Unit) > D.BlowbyDot then
+    blowby = flatV.Magnitude > D.BlowbySpeed and gap < D.BlowbyGap
   end
+  -- ПЕРЕХВАТ НА ПРОХОДЕ ТОЖЕ ОСТАЁТСЯ НА ЛИНИИ.
+  -- Было flatT + look*BlowbyAhead + (vel*0.3)*FLAT: последнее слагаемое давало
+  -- до пяти студов вбок, и точка улетала мимо самого атакующего. В журнале это
+  -- «target at 1.7 stds, spot 10.1 away» — цель рядом, а бежим неизвестно куда.
+  if blowby then stand = math.max(stand, D.BlowbyAhead) end
 
-  local spot
-  if blowby then
-    spot = flatT + cf.LookVector*D.BlowbyAhead + (vel*0.3)*FLAT
-  else
-    spot = cf.Position + cf.LookVector*stand
-                       + cf.LookVector*(fwd < 0 and 0 or fwd)
-                       + cf.RightVector*lat
+  local spot = pred + u * stand
+  -- Насколько мы САМИ сейчас в стороне от линии «он — кольцо». Это и есть
+  -- число, по которому в следующем дампе будет видно, стало ли ровно.
+  do
+    local rel = (me*FLAT) - flatT
+    local along = rel:Dot(u)
+    HUB.defOffLine = math.floor((rel - u*along).Magnitude * 10) / 10
   end
 
   local sprint
   if blowby then sprint = true
-  elseif ((me*FLAT) - spot*FLAT).Magnitude > D.SprintDist or ahead then
+  elseif ((me*FLAT) - spot).Magnitude > D.SprintDist or behind then
     local stam = sAttr(chr(), "Stamina")
     sprint = (type(stam) ~= "number") or (stam > D.StaminaMin)
-  else sprint = ahead end
+  else sprint = behind end
   return spot, sprint, blowby
 end
 
@@ -5699,7 +6308,10 @@ local function blatantRelease()
   BL.state = BL.provisional and "idle" or "done"
   BL.provisional = false
   BL.doneAt = os.clock()
-  if CFG.Blatant.Restore and BL.realCF then
+  -- ВОЗВРАТ НА МЕСТО ТОЖЕ СБИВАЛ ПРЫЖОК: tpProxy гасит скорость и тянет тело
+  -- обратно вниз. Пока мы в воздухе или прыжок ещё не подтверждён — не трогаем.
+  local airborne = (BL.jumpUntil ~= nil) or sAttr(chr(), "InAir") == true
+  if CFG.Blatant.Restore and BL.realCF and not airborne then
     local pc = proxyPart()
     if pc then tpProxy(pc, BL.realCF) end
   end
@@ -5719,8 +6331,8 @@ local function blatantRelease()
     pcall(Mt.FireServer, R.Move, Vector3.new(0,0,0))
     HUB.lastDir = nil
   end
-  if HUB.sprintOn then pcall(Mt.FireServer, R.Sprint, false); HUB.sprintOn = false end
   HUB.bypass = false
+  if HUB.sprintOn then PBX.sprintSend(false); HUB.sprintOn = false end
 end
 
 local function contestEngage(c, why, provisional)
@@ -5728,6 +6340,25 @@ local function contestEngage(c, why, provisional)
   if not (HUB.running and B.Enabled) then return false end
 
   if BL.state == "hold" and BL.target == c then
+    -- ПОВЫШЕНИЕ ЗАМАХА ДО ПРЫЖКА, КОТОРОГО РАНЬШЕ НЕ БЫЛО.
+    -- Вход по windup ставил стойку и уходил сюда КАЖДЫЙ следующий кадр. Когда
+    -- Action менялся на Dunking, эта ветка возвращала true, ничего не меняя:
+    -- wantJump так и оставался false. То есть на данке скрипт стоял в стойке
+    -- под кольцом и не прыгал вообще — ровно то, что видно снаружи.
+    if not BL.wantJump and PBX.rimAttack(c, why) then
+      BL.wasRim, BL.wantJump = true, true
+      BL.wantG, BL.gUntil = false, nil
+      BL.jumpN, BL.jumpAt = 0, 0
+      BL.jumpUntil = os.clock() + CFG.Blatant.JumpWindow
+      -- Стойку снимаем сразу: под кольцом она уже ничего не даёт, а держать
+      -- G и прыгать одновременно смысла нет.
+      if BL.heldG and R.HoldG then
+        BL.heldG = false
+        HUB.bypass = true
+        pcall(Mt.FireServer, R.HoldG, { HoldingG = false })
+        HUB.bypass = false
+      end
+    end
     if not provisional then
       BL.provisional = false
       BL.heldFrom = BL.heldFrom or os.clock()
@@ -5768,10 +6399,7 @@ local function contestEngage(c, why, provisional)
   -- Обычный бросок накрывается СТОЙКОЙ: контест начисляется за защитника
   -- рядом, а прыжок на джампшоте только уводит нас с земли. Данк и лэйап идут
   -- выше кольца — там нужен ПРЫЖОК, стойка внизу бесполезна.
-  local isRim = (why == "rim attack") or (function()
-    local a = sAttr(c, "Action")
-    return a == "Dunking" or a == "ContactLayup"
-  end)()
+  local isRim = PBX.rimAttack(c, why, provisional and "windup" or nil)
   BL.wasRim = isRim
 
   -- НАМЕРЕНИЯ, А НЕ ОДИН ВЫСТРЕЛ В ПУСТОТУ.
@@ -5783,8 +6411,11 @@ local function contestEngage(c, why, provisional)
   BL.wantG    = (B.HoldG and R.HoldG and not isRim) and true or false
   BL.wantJump = isRim and true or false
   BL.jumped, BL.gSent, BL.gAt = false, 0, 0
+  BL.jumpN, BL.jumpAt = 0, 0
   -- Стойка начинается СЕЙЧАС, в момент обнаружения, и живёт своё время.
   BL.gUntil = BL.wantG and (os.clock() + B.StanceTime) or nil
+  -- Прыжок тоже: один пакет мог не дойти, а тик подмены живёт всего HoldTime.
+  BL.jumpUntil = BL.wantJump and (os.clock() + B.JumpWindow) or nil
 
   -- ФАЛЬШИВЫЙ БРОСОК УБРАН СОВСЕМ.
   -- Он слал Shoot=true, Jump и через 0.12 с Shoot=false мимо нашего же хука.
@@ -5799,12 +6430,37 @@ end
 -- Подмена длится доли секунды, стойка — своё время. Пока оно идёт, при
 -- необходимости переотправляем; когда вышло — снимаем ровно один раз.
 track(RunService.Heartbeat:Connect(function()
-  if not (HUB.running and BL.gUntil) then return end
+  if not HUB.running then return end
+  -- ПРЫЖОК ЖИВЁТ ДОЛЬШЕ ПОДМЕНЫ ПОЗИЦИИ, И ЭТО ОТДЕЛЬНЫЙ ПРИСМОТР.
+  -- Раньше Jump уходил ОДИН раз из тика накрытия, а тот через HoldTime = 0.12 с
+  -- закрывался. Потерянный пакет, Debounce на сервере или ещё не прошедшее
+  -- приземление — и прыжка не было вовсе. Повторяем, пока сервер не подтвердит
+  -- атрибутом InAir, но не дольше JumpWindow и не больше трёх раз.
+  if BL.jumpUntil then
+    if sAttr(chr(), "InAir") == true then
+      BL.jumpUntil = nil
+    elseif os.clock() >= BL.jumpUntil or (BL.jumpN or 0) >= 3 then
+      BL.jumpUntil = nil
+    elseif R.Jump and os.clock() - (BL.jumpAt or 0) > 0.10 then
+      BL.jumpAt = os.clock()
+      BL.jumpN = (BL.jumpN or 0) + 1
+      BL.jumped = true
+      HUB.bypass = true
+      pcall(Mt.FireServer, R.Jump)
+      HUB.bypass = false
+    end
+  end
+  if not BL.gUntil then return end
   if os.clock() < BL.gUntil then
     if R.HoldG and sAttr(chr(), "HoldingG") ~= true
        and os.clock() - (BL.gAt or 0) > 0.12 then
       BL.gAt = os.clock()
       BL.gSent = (BL.gSent or 0) + 1
+      -- Отметку об удержании ставим И ЗДЕСЬ. Раньше её ставил только тик
+      -- подмены позиции, а он живёт HoldTime = 0.12 с: если стойку дожимал
+      -- один этот присмотр, heldG оставался false, и по истечении времени
+      -- ветка снятия ниже не срабатывала — G оставалась зажатой навсегда.
+      BL.heldG = true
       HUB.bypass = true
       pcall(Mt.FireServer, R.HoldG, { HoldingG = true })
       HUB.bypass = false
@@ -5862,9 +6518,16 @@ track(RunService.Heartbeat:Connect(function(dt)
 
       BL.since = nil
       BL.heldFrom = BL.heldFrom or os.clock()
-      if os.clock() - BL.heldFrom > B.HoldTime then
+      -- ЗАМЕР СНИМАЕМ ДО ВЫЗОВА, А НЕ ПОСЛЕ.
+      -- blatantRelease обнуляет BL.heldFrom (строка с "BL.heldFrom = nil"),
+      -- и следующая строка читала уже nil. Это и есть ошибка из отчёта:
+      -- "attempt to perform arithmetic (sub) on number and nil", строка 5867.
+      -- Она рвала кадровый тик накрытия целиком, поэтому Contest Shooter
+      -- переставал и держать стойку, и прыгать до перезапуска скрипта.
+      local heldMs = (os.clock() - BL.heldFrom) * 1000
+      if heldMs > B.HoldTime * 1000 then
         blatantRelease()
-        HUB.blatantWhy = ("held %.0f ms"):format((os.clock() - BL.heldFrom)*1000)
+        HUB.blatantWhy = ("held %.0f ms"):format(heldMs)
         return
       end
     end
@@ -5879,19 +6542,23 @@ track(RunService.Heartbeat:Connect(function(dt)
         HUB.bypass = false
       end
     end
-    -- ПРЫЖОК НА ДАНК: один раз, и только с земли.
-    -- Слать Jump в воздухе бессмысленно, а физику подъёма ведёт сама игра —
-    -- мы в неё не вмешиваемся (в хуке скорости стоит выход по InAir).
-    if BL.wantJump and not BL.jumped and R.Jump
-       and sAttr(chr(), "InAir") ~= true then
-      BL.jumped = true
-      HUB.bypass = true
-      pcall(Mt.FireServer, R.Jump)
-      HUB.bypass = false
-    end
+    -- ПРЫЖОК ОТДАН ПРИСМОТРУ ВЫШЕ: он переотправляет, пока сервер не ответит.
 
+    -- ПОДМЕНА ПОЗИЦИИ УБИВАЛА СОБСТВЕННЫЙ ПРЫЖОК, И ЭТО ГЛАВНАЯ ПРИЧИНА.
+    -- blatantHold зовёт tpProxy, а тот ОБНУЛЯЕТ AssemblyLinearVelocity и
+    -- переставляет BodyPosition с AlignPosition. Каждый кадр. То есть мы
+    -- отправляли Jump и тут же гасили всю вертикальную скорость, которую игра
+    -- только что задала: персонаж дёргался на месте вместо подъёма. Пока
+    -- прыжок в работе или мы в воздухе — позицию не держим вообще, физику
+    -- ведёт игра. Стойка при этом продолжает работать, она не про позицию.
+    local jumping = BL.wasRim
+      and ((BL.jumpUntil ~= nil) or sAttr(chr(), "InAir") == true)
     local cp = posOf(sChild(tgt, "HumanoidRootPart"))
     local hp = hoopWeDefend()
+    if jumping then
+      HUB.blatantWhy = ("jumping on %s (%d sent)"):format(tostring(sAttr(tgt, "Action")), BL.jumpN or 0)
+      cp = nil
+    end
     if cp and hp then
       local toHoop = (hp - cp) * FLAT
       if toHoop.Magnitude > 0.1 then
@@ -5931,11 +6598,7 @@ track(RunService.Heartbeat:Connect(function(dt)
     -- слишком часто». Признак настоящего броска тот же, что у нашего метра:
     -- сначала СБРОС ниже ResetBelow, и только потом рост. Без сброса не входим.
     if not want and isEnemy(c) and B.MeterTrigger > 0 then
-      local mv = sAttr(c, "meterOffset")
-      local m
-      if typeof(mv) == "Vector2" then
-        local ax, ay = math.abs(mv.X), math.abs(mv.Y); m = (ay > ax) and ay or ax
-      elseif type(mv) == "number" then m = math.abs(mv) end
+      local m = PBX.meterOf(c)
       local st = BL.foeM[c]
       if not hasBall(c) then
         BL.foeM[c] = nil
@@ -5995,6 +6658,7 @@ local function unstick()
   BL.state = "idle"
   HUB.blatantHolding = false
   BL.provisional, BL.heldFrom, BL.since, BL.heldG = false, nil, nil, false
+  BL.jumpUntil, BL.gUntil, BL.wantJump, BL.wantG = nil, nil, false, false
   if pc then pcall(function() pc.Anchored = false end) end
 
   if BL.realCF then tpProxy(pc, BL.realCF)
@@ -6002,8 +6666,8 @@ local function unstick()
     local hp = posOf(sChild(chr(), "HumanoidRootPart"))
     if pc and hp then tpProxy(pc, CFrame.new(hp)) end
   end
+  PBX.sprintSend(false)
   HUB.bypass = true
-  pcall(Mt.FireServer, R.Sprint, false)
   pcall(Mt.FireServer, R.Move, Vector3.new(0,0,0))
   pcall(Mt.FireServer, R.Shoot, { Shoot = false })
   HUB.bypass = false
@@ -6061,6 +6725,21 @@ local function save()
 
     antiPreShot = CFG.AntiDef.PreShot, antiShot = HUB.antiShot,
     antiAgo = HUB.antiAt and (os.clock() - HUB.antiAt) or nil,
+    antiDribOn = CFG.AntiDef.Dribble, antiDrib = HUB.antiDrib,
+    antiDribN = HUB.antiDribN, antiDribMove = CFG.AntiDef.DribbleCombo,
+    antiPushOn = CFG.AntiDef.PushOn,
+    s3Mode = CFG.S3.Mode, s3Walk = HUB.s3Walk,
+    hideSprint = CFG.Zero.HideSprint, sprintHidden = HUB.sprintHidden,
+    wantSprint = HUB.wantSprint,
+    defOffLine = HUB.defOffLine, defLeadMax = CFG.Defense.LeadMax,
+    flingOn = CFG.Fling.Enabled, flingMethod = CFG.Fling.Method,
+    flingWhy = HUB.flingWhy, flingN = HUB.flingN,
+    visZones = CFG.Vis.Zones, visPath = CFG.Vis.Path,
+    navOwner = HUB.navOwner,
+    blatantJumpN = BL and BL.jumpN or nil,
+    blatantRimGuess = CFG.Blatant.RimGuess,
+    blatantStance = CFG.Blatant.StanceTime, blatantJumpWin = CFG.Blatant.JumpWindow,
+    gateMiss = HUB.gateMiss, gateFit = HUB.gateFit,
     slipEnabled = CFG.Move.Slip.Enabled, slipKeepAgo = HUB.slipKeep
       and (os.clock() - HUB.slipKeep) or nil,
 
@@ -6276,6 +6955,26 @@ local function save()
             tostring(HUB.s3Why or "no shot yet")))
   rep(("[PB] errors: %d | last: %s")
     :format(HUB.errN or 0, tostring(HUB.lastErr or "none")))
+  -- Причины отказов перехвата теперь константы (их считали каждый кадр),
+  -- поэтому числа к ним разворачиваем ЗДЕСЬ, один раз на выгрузку.
+  if HUB.gateMiss then
+    local g = HUB.gateMiss
+    rep(("[PB] last intercept gate: closest to %s %.1f > %.1f (base %.1f + slack %.1f at %.2f s)")
+      :format(tostring(g.scope), g.d or -1, g.tol or -1,
+              g.rad or -1, g.slack or -1, g.at or -1))
+  end
+  if HUB.gateFit then
+    rep(("[PB] last fit gate: %d of %d points"):format(HUB.gateFit.have or 0, HUB.gateFit.need or 0))
+  end
+  rep(("[PB] anti defense: push=%s | dribble=%s (%s) | %s")
+    :format(tostring(CFG.AntiDef.PushOn), tostring(CFG.AntiDef.Dribble),
+            tostring(CFG.AntiDef.DribbleCombo), tostring(HUB.antiDrib or "-")))
+  rep(("[PB] sprint: hidden=%s swallowed=%d | player wants sprint=%s")
+    :format(tostring(CFG.Zero.HideSprint), HUB.sprintHidden or 0,
+            tostring(HUB.wantSprint)))
+  rep(("[PB] defense: we are %s stds off the line to the hoop (lead cap %.1f)")
+    :format(HUB.defOffLine and ("%.1f"):format(HUB.defOffLine) or "-",
+            CFG.Defense.LeadMax))
   rep(("[PB] ping=%.0fms(%s, fails %d) | k=%.2f -> correction=%.3f | rate=%s")
     :format(dataPing()*1000, HUB.pingSource, HUB.pingFails,
             CFG.PingCoef, pingCorr(),
@@ -6491,7 +7190,18 @@ end
 local function baseSpeedNoPenalty()
   local ws = sAttr(chr(), "WalkSpeed")
   ws = (type(ws) == "number") and math.min(ws, 14) or 14
-  local sprinting = sAttr(chr(), "Sprinting") == true
+  -- ПРИ СКРЫТОМ СПРИНТЕ АТРИБУТ SPRINTING ЧЕСТНО ЛЕЖИТ В FALSE.
+  -- Сервер его и не должен видеть — в этом вся суть. Значит и решать, есть
+  -- ли прибавка, надо не по атрибуту, а по НАМЕРЕНИЮ игрока: последний
+  -- проглоченный пакет спринта лежит в HUB.wantSprint.
+  -- Написано через if, а не через "a and b or c": при wantSprint = false
+  -- тернарная запись свалилась бы в третью ветку и прочитала бы атрибут.
+  local sprinting
+  if CFG.Zero.Enabled and CFG.Zero.HideSprint then
+    sprinting = (HUB.wantSprint == true)
+  else
+    sprinting = (sAttr(chr(), "Sprinting") == true)
+  end
   local st = sAttr(chr(), "Stamina")
   if sprinting and ((type(st) ~= "number") or st > 0.25) then
     ws = ws + (CFG.Move.Sprint.Enabled and CFG.Move.Sprint.Bonus or 3.35)
@@ -6680,7 +7390,10 @@ local function installVelHook()
               -- На броске скорость всегда наша: игровая ветка сюда не дошла.
               want = M.Speed.Enabled and M.Speed.Value or baseSpeedNoPenalty()
             elseif M.Speed.Enabled then want = M.Speed.Value
-            elseif M.Strafe.Enabled or M.Sprint.Enabled or M.Preset.Enabled then
+            elseif M.Strafe.Enabled or M.Sprint.Enabled or M.Preset.Enabled
+                or (CFG.Zero.Enabled and CFG.Zero.HideSprint) then
+              -- Скрытый спринт обязан САМ вернуть отобранную прибавку:
+              -- игра её больше не даст, она не видит флага.
               want = baseSpeedNoPenalty()
             end
             if not want then return end
@@ -6809,9 +7522,16 @@ track(RunService.Heartbeat:Connect(function()
         for i = 1, #list do
           local d = list[i]
           if d.Parent then
-            if foeClipSaved[d] == nil then foeClipSaved[d] = true end
-            d.CanCollide = false
             n += 1
+            -- СНАЧАЛА ЧИТАЕМ, ПОТОМ ПИШЕМ.
+            -- Безусловная запись CanCollide каждый кадр на каждую деталь
+            -- каждого соседа помечает физику грязной и заставляет движок
+            -- перестраивать широкую фазу. Чтение стоит несравнимо дешевле,
+            -- а результат тот же: коллизия всё равно остаётся снятой.
+            if d.CanCollide then
+              if foeClipSaved[d] == nil then foeClipSaved[d] = true end
+              d.CanCollide = false
+            end
           end
         end
       end)
@@ -6860,6 +7580,130 @@ track(RunService.Heartbeat:Connect(function()
   HUB.noclipParts = #list
 end))
 
+-- ОТБРОС. ТРИ СПОСОБА, ПОТОМУ ЧТО ЖИВЁТ ИЗ НИХ КАЖДЫЙ РАЗ РАЗНОЕ.
+-- Механика одна на все три. Клиент владеет физикой СВОЕЙ сборки (network
+-- ownership), и экстремальные значения скорости на ней попадают в общий
+-- решатель столкновений. Чужой персонаж принадлежит чужому клиенту, но
+-- контакт всё равно считается обеими сторонами — отсюда и отброс. Документация
+-- Roblox называет это прямо: владелец может выставить Inf или NaN и «помешать
+-- физике других сборок, даже тех, которыми не владеет».
+-- Наше настоящее тело закреплено, сталкивается ProxyCharacter — работаем с ним.
+--   Velocity — знакопеременная линейная и угловая скорость: положение почти
+--              не плывёт, а импульс в момент контакта огромен.
+--   Spin     — классическая раскрутка одной угловой скоростью.
+--   Teleport — рассинхрон ПОЛОЖЕНИЯ: кадр у цели, кадр далеко. Остаётся
+--              рабочим там, где скорость подрезают на входе.
+-- Пока тумблер включён, отброс идёт вспышками: Duration работы, потом пауза,
+-- потом снова. Так его видно и им можно управлять, не ловя один кадр.
+local FL = { on = false, cf = nil, until_ = 0, nextAt = 0, flip = 1, tgt = nil }
+
+-- Постановка без обнуления скорости: tpProxy для этого не годится, он гасит
+-- AssemblyLinearVelocity, то есть ровно то, ради чего всё и затевается.
+function PBX.flingPlace(pc, pos)
+  pc.CFrame = CFrame.new(pos)
+  local bp = pc:FindFirstChild("BodyPosition"); if bp then bp.Position = pos end
+  local mv = pc:FindFirstChild("MovementVelocity")
+  if mv then mv.Velocity = Vector3.new() end
+  local ph = pc:FindFirstChild("Physics")
+  local ap = ph and ph:FindFirstChild("AlignPosition")
+  if ap and ap.Mode == Enum.PositionAlignmentMode.OneAttachment then
+    ap.Position = pos
+  end
+end
+
+function PBX.flingTarget()
+  local me = selfPos(); if not me then return nil end
+  local F = CFG.Fling
+  local best, bd = nil, nil
+  for _, c in ipairs(charsList()) do
+    if c ~= chr() and ((not F.Foes) or isEnemy(c)) then
+      local p = posOf(sChild(c, "HumanoidRootPart"))
+      if p then
+        local d = (p - me).Magnitude
+        if d <= F.Radius and (not bd or d < bd) then best, bd = c, d end
+      end
+    end
+  end
+  return best, bd
+end
+
+function PBX.flingStop(why)
+  if not FL.on then return end
+  FL.on = false
+  FL.nextAt = os.clock() + 0.6
+  local pc = proxyPart()
+  if pc then
+    pcall(function()
+      pc.AssemblyAngularVelocity = Vector3.new()
+      pc.AssemblyLinearVelocity = Vector3.new()
+    end)
+    -- Возврат на своё место обязателен: иначе улетаем вместе с целью.
+    if FL.cf then tpProxy(pc, FL.cf) end
+  end
+  FL.cf, FL.tgt = nil, nil
+  HUB.flingWhy = why or "stopped"
+end
+
+function PBX.flingStart()
+  if FL.on or os.clock() < FL.nextAt then return end
+  local pc = proxyPart()
+  if not pc then HUB.flingWhy = "no proxy body"; return end
+  local tgt, d = PBX.flingTarget()
+  if not tgt then
+    HUB.flingWhy = ("nobody within %.0f stds"):format(CFG.Fling.Radius)
+    return
+  end
+  local okc, cf = pcall(RDR.CFrame, pc)
+  if not (okc and cf) then HUB.flingWhy = "proxy unreadable"; return end
+  if CFG.Fling.SimBoost then
+    -- Без расширенного радиуса симуляции движок часто просто не отдаёт нам
+    -- физику соседа, и любой из трёх способов молча не делает ничего.
+    pcall(function()
+      if sethiddenproperty then
+        sethiddenproperty(LP, "SimulationRadius", math.huge)
+        sethiddenproperty(LP, "MaximumSimulationRadius", math.huge)
+      end
+    end)
+  end
+  FL.on, FL.cf, FL.tgt, FL.flip = true, cf, tgt, 1
+  FL.until_ = os.clock() + CFG.Fling.Duration
+  HUB.flingN = (HUB.flingN or 0) + 1
+  HUB.flingWhy = ("%s on %s at %.1f stds (burst %d)")
+    :format(tostring(CFG.Fling.Method), tgt.Name, d or -1, HUB.flingN)
+end
+
+track({ Disconnect = function() PBX.flingStop("unloaded") end })
+track(RunService.Heartbeat:Connect(function()
+  if not HUB.running then PBX.flingStop("script stopped"); return end
+  if not CFG.Fling.Enabled then
+    if FL.on then PBX.flingStop("switched off") end
+    return
+  end
+  if not FL.on then PBX.flingStart(); return end
+  if os.clock() > FL.until_ then PBX.flingStop("burst finished"); return end
+  local pc = proxyPart(); if not pc then PBX.flingStop("proxy gone"); return end
+  local tp = FL.tgt and posOf(sChild(FL.tgt, "HumanoidRootPart"))
+  if not tp then PBX.flingStop("target gone"); return end
+
+  local F = CFG.Fling
+  local P = F.Power
+  FL.flip = -FL.flip
+  pcall(function()
+    if F.Method == "Spin" then
+      PBX.flingPlace(pc, tp)
+      pc.AssemblyAngularVelocity = Vector3.new(0, P, 0)
+      pc.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+    elseif F.Method == "Teleport" then
+      PBX.flingPlace(pc, (FL.flip > 0) and tp or (tp + Vector3.new(0, 3000, 0)))
+      pc.AssemblyLinearVelocity = Vector3.new()
+    else
+      PBX.flingPlace(pc, tp)
+      pc.AssemblyLinearVelocity  = Vector3.new(P, P, P) * FL.flip
+      pc.AssemblyAngularVelocity = Vector3.new(P, P, P) * FL.flip
+    end
+  end)
+end))
+
 track(RunService.Heartbeat:Connect(function(dt)
   local M = CFG.Move
   if not (HUB.running and M.Fly.Enabled) then
@@ -6897,9 +7741,7 @@ track(RunService.Heartbeat:Connect(function()
   if not (HUB.running and CFG.Move.AutoSprint.Enabled) then
     if HUB.sprintAuto then
       HUB.sprintAuto = false
-      HUB.bypass = true
-      pcall(Mt.FireServer, R.Sprint, false)
-      HUB.bypass = false
+      PBX.sprintSend(false)
     end
     return
   end
@@ -6908,9 +7750,7 @@ track(RunService.Heartbeat:Connect(function()
   if CFG.Zero.Enabled and CFG.Zero.KillSprint and os.clock() < zeroUntil then
     if HUB.sprintAuto then
       HUB.sprintAuto = false
-      HUB.bypass = true
-      pcall(Mt.FireServer, R.Sprint, false)
-      HUB.bypass = false
+      PBX.sprintSend(false)
     end
     return
   end
@@ -6936,9 +7776,7 @@ track(RunService.Heartbeat:Connect(function()
   local want = moving and can
   if want ~= (HUB.sprintAuto == true) then
     HUB.sprintAuto = want
-    HUB.bypass = true
-    pcall(Mt.FireServer, R.Sprint, want)
-    HUB.bypass = false
+    PBX.sprintSend(want)
   end
 end))
 
@@ -7182,6 +8020,9 @@ function HUB.unload()
   hideAll()
   for _,l in pairs(lines) do if l then pcall(function() l:Remove() end) end end
   for _,m in pairs(marks) do if m then pcall(function() m:Remove() end) end end
+  pcall(VZ.hideAll)
+  for _,l in pairs(VZ.lines) do if l then pcall(function() l:Remove() end) end end
+  for _,t in pairs(VZ.texts) do if t then pcall(function() t:Remove() end) end end
   for _,c in ipairs(HUB.conns) do pcall(function() c:Disconnect() end) end
   pcall(restoreMoveKeys)
   if oldNamecall then pcall(function() hookmetamethod(game,"__namecall",oldNamecall) end) end
@@ -7324,6 +8165,22 @@ return function(_Lib, _Core)
       })
       s2b:SubLabel({ Text = "on a two near the line, register the shot from behind it" })
       s2b:SubLabel({ Text = "works alone, and takes priority over Distance Spoof when both are on" })
+      local s3Legit = {}
+      s2b:Dropdown({
+        Name = "Mode", Options = { "Teleport", "Legit" },
+        Default = CFG.S3.Mode, Required = true,
+        Callback = function(v)
+          if type(v) ~= "string" then return end
+          CFG.S3.Mode = v
+          if v == "Legit" then moveEngineOn() end
+          for _, el in ipairs(s3Legit) do
+            if el and el.SetVisibility then pcall(el.SetVisibility, el, v == "Legit") end
+            local d = el and el._desc
+            if d and d.SetVisibility then pcall(d.SetVisibility, d, v == "Legit") end
+          end
+        end,
+      }, ctx.flag("S3_Mode"))
+      s2b:SubLabel({ Text = "Teleport fakes the spot | Legit walks you out for real" })
       slider(s2b, { Name = "Line Distance", Flag = "S3_Line", Default = CFG.S3.LineDist,
         Min = 12, Max = 40, Precision = 1, Suffix = " stds",
         Callback = function(v) CFG.S3.LineDist = v end,
@@ -7336,6 +8193,19 @@ return function(_Lib, _Core)
         Min = 0, Max = 5, Precision = 1, Suffix = " stds",
         Callback = function(v) CFG.S3.Extra = v end,
         Desc = "margin behind the arc, too small and the server still calls a 2" })
+      s3Legit[#s3Legit+1] = slider(s2b, { Name = "Walk Time", Flag = "S3_StepTime",
+        Default = CFG.S3.StepTime, Min = 0.1, Max = 0.8, Precision = 2, Suffix = " s",
+        Callback = function(v) CFG.S3.StepTime = v end,
+        Desc = "how long it keeps backing out after the press" })
+      s3Legit[#s3Legit+1] = slider(s2b, { Name = "Walk Speed", Flag = "S3_Speed",
+        Default = CFG.S3.Speed, Min = 14, Max = 40, Suffix = " stds/s",
+        Callback = function(v) CFG.S3.Speed = v end,
+        Desc = "written to velocity directly, the game itself caps you at 17" })
+      for _, el in ipairs(s3Legit) do
+        if el and el.SetVisibility then pcall(el.SetVisibility, el, CFG.S3.Mode == "Legit") end
+        local d = el and el._desc
+        if d and d.SetVisibility then pcall(d.SetVisibility, d, CFG.S3.Mode == "Legit") end
+      end
       bool(s2b, "Hold Until Score", "keep the fake spot until the ball resolves",
         function() return CFG.S3.Hold end,
         function(v) CFG.S3.Hold = v end, "S3_Hold")
@@ -7504,6 +8374,23 @@ return function(_Lib, _Core)
       bool(s5, "Drop Sprint", "clear the sprint flag and the payload field",
         function() return CFG.Zero.KillSprint end,
         function(v) CFG.Zero.KillSprint = v end, "ZS_Sprint")
+      bool(s5, "Hide Sprint",
+        "the server never sees sprint at all, the speed is written locally instead",
+        function() return CFG.Zero.HideSprint end,
+        function(v)
+          CFG.Zero.HideSprint = v
+          if v then
+            moveEngineOn()
+            -- Сервер обязан УЗНАТЬ, что спринта больше нет: иначе поднятый
+            -- прошлым нажатием флаг Sprinting так и останется висеть.
+            HUB.bypass = true
+            pcall(Mt.FireServer, R.Sprint, false)
+            HUB.bypass = false
+            HUB.sprintOn = false
+          else
+            PBX.sprintSend(HUB.wantSprint == true)
+          end
+        end, "ZS_HideSprint")
       bool(s5, "Whole Shot", "stand from the shot start, not only at release",
         function() return CFG.Zero.FromStart end,
         function(v) CFG.Zero.FromStart = v end, "ZS_FromStart")
@@ -7590,9 +8477,14 @@ return function(_Lib, _Core)
       slider(s1, { Name = "Standoff On Shot", Flag = "DEF_StandShoot", Default = CFG.Defense.StandShoot,
         Min = 1, Max = 10, Precision = 1, Suffix = " stds",
         Callback = function(v) CFG.Defense.StandShoot = v end })
-      slider(s1, { Name = "Lead", Flag = "DEF_LeadFwd", Default = CFG.Defense.LeadFwd,
+      slider(s1, { Name = "Back Off On Drives", Flag = "DEF_LeadFwd", Default = CFG.Defense.LeadFwd,
         Min = 0, Max = 0.4, Precision = 2, Suffix = " s",
-        Callback = function(v) CFG.Defense.LeadFwd = v end })
+        Callback = function(v) CFG.Defense.LeadFwd = v end,
+        Desc = "extra standoff while he charges the rim, measured along the line" })
+      slider(s1, { Name = "Lead Cap", Flag = "DEF_LeadMax", Default = CFG.Defense.LeadMax,
+        Min = 0, Max = 8, Precision = 1, Suffix = " stds",
+        Callback = function(v) CFG.Defense.LeadMax = v end,
+        Desc = "how far ahead of him the spot may be predicted, 0 stands on him exactly" })
 
       local s2 = T:Section({ Side = "Right" })
       s2:Header({ Name = "Auto Defense · Blow-By" })
@@ -7732,6 +8624,14 @@ return function(_Lib, _Core)
       bool(s4, "Hold Stance", "near costs him accuracy, in stance costs him the shot",
         function() return CFG.Blatant.HoldG end,
         function(v) CFG.Blatant.HoldG = v end)
+      slider(s4, { Name = "Jump Window", Flag = "BL_JumpWin", Default = CFG.Blatant.JumpWindow,
+        Min = 0.1, Max = 1.2, Precision = 2, Suffix = " s",
+        Callback = function(v) CFG.Blatant.JumpWindow = v end,
+        Desc = "keeps re-sending the jump until the server confirms you left the floor" })
+      slider(s4, { Name = "Call It A Dunk Within", Flag = "BL_RimGuess",
+        Default = CFG.Blatant.RimGuess, Min = 0, Max = 20, Precision = 1, Suffix = " stds",
+        Callback = function(v) CFG.Blatant.RimGuess = v end,
+        Desc = "a gather this close to the rim ends in a dunk, jump now instead of waiting" })
 
     end
 
@@ -8132,6 +9032,36 @@ return function(_Lib, _Core)
       slider(s2, { Name = "Flight Hold", Flag = "MS_FlightHold", Default = CFG.Traj.FlightHold,
         Min = 0.05, Max = 0.6, Precision = 2, Suffix = " s",
         Callback = function(v) CFG.Traj.FlightHold = v end })
+
+      local s3 = T:Section({ Side = "Left" })
+      feature(s3, {
+        Title = "Zone Overlay", Flag = "VZ_Zones",
+        get = function() return CFG.Vis.Zones end,
+        set = function(v) CFG.Vis.Zones = v end,
+        Desc = "draws on the floor the range each feature actually works in"
+      })
+      s3:SubLabel({ Text = "only rings of features you have switched on are drawn" })
+      s3:SubLabel({ Text = "orange Distance Spoof | blue Smart 3PT | pink Contact Slip" })
+      slider(s3, { Name = "Smoothness", Flag = "VZ_Seg", Default = CFG.Vis.Segments,
+        Min = 8, Max = 64,
+        Callback = function(v) CFG.Vis.Segments = v end,
+        Desc = "segments per circle, lower is cheaper on frames" })
+      slider(s3, { Name = "Line Width", Flag = "VZ_ZoneThick", Default = CFG.Vis.Thick,
+        Min = 1, Max = 6,
+        Callback = function(v) CFG.Vis.Thick = v end })
+      bool(s3, "Labels", "name every ring and print the current action",
+        function() return CFG.Vis.Labels end,
+        function(v) CFG.Vis.Labels = v end, "VZ_Labels")
+
+      local s4 = T:Section({ Side = "Right" })
+      feature(s4, {
+        Title = "Script Path", Flag = "VZ_Path",
+        get = function() return CFG.Vis.Path end,
+        set = function(v) CFG.Vis.Path = v end,
+        Desc = "arrows to the spot the script is walking you to, and why"
+      })
+      s4:SubLabel({ Text = "green intercept | blue auto move | yellow defense | red anti defense" })
+      s4:SubLabel({ Text = "the arrows fade out on their own once nothing is steering you" })
     end
 
     do
@@ -8163,6 +9093,43 @@ return function(_Lib, _Core)
       slider(s4, { Name = "Jump Cooldown", Flag = "MS_JumpCD", Default = CFG.Grab.JumpCD,
         Min = 0.1, Max = 1.5, Precision = 2, Suffix = " s",
         Callback = function(v) CFG.Grab.JumpCD = v end })
+
+      local s5 = T:Section({ Side = "Left" })
+      feature(s5, {
+        Title = "Fling", Flag = "MS_Fling",
+        get = function() return CFG.Fling.Enabled end,
+        set = function(v)
+          CFG.Fling.Enabled = v
+          if not v then PBX.flingStop("switched off") end
+        end,
+        Desc = "throws the nearest player with a physics desync on the proxy body"
+      })
+      s5:Dropdown({
+        Name = "Method", Options = { "Velocity", "Spin", "Teleport" },
+        Default = CFG.Fling.Method, Required = true,
+        Callback = function(v) if type(v) == "string" then CFG.Fling.Method = v end end,
+      }, ctx.flag("MS_FlingMethod"))
+      s5:SubLabel({ Text = "three of them because the engine blocks these one at a time" })
+      s5:SubLabel({ Text = "it pulls you onto him, then puts you back where you were" })
+      slider(s5, { Name = "Power", Flag = "MS_FlingPower", Default = CFG.Fling.Power,
+        Min = 1000, Max = 400000,
+        Callback = function(v) CFG.Fling.Power = v end,
+        Desc = "velocity magnitude written each frame, higher is not always better" })
+      slider(s5, { Name = "Radius", Flag = "MS_FlingRad", Default = CFG.Fling.Radius,
+        Min = 4, Max = 40, Suffix = " stds",
+        Callback = function(v) CFG.Fling.Radius = v end,
+        Desc = "nobody inside this and it simply waits" })
+      slider(s5, { Name = "Burst", Flag = "MS_FlingDur", Default = CFG.Fling.Duration,
+        Min = 0.2, Max = 4.0, Precision = 2, Suffix = " s",
+        Callback = function(v) CFG.Fling.Duration = v end,
+        Desc = "one burst, then a short pause, repeating while this is on" })
+      bool(s5, "Opponents Only", "otherwise it grabs the nearest player of any team",
+        function() return CFG.Fling.Foes end,
+        function(v) CFG.Fling.Foes = v end, "MS_FlingFoes")
+      bool(s5, "Boost Simulation Radius",
+        "without it the engine often will not hand you his physics at all",
+        function() return CFG.Fling.SimBoost end,
+        function(v) CFG.Fling.SimBoost = v end, "MS_FlingSim")
     end
 
     do
