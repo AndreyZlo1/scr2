@@ -1,4 +1,4 @@
---[[ PRACTICAL BASKETBALL v150 — Potassium/UNC — модуль для лоадера Syllinse ]]
+--[[ PRACTICAL BASKETBALL v151 — Potassium/UNC — модуль для лоадера Syllinse ]]
 
 -- Luraph macro prelude. Installed through STRING KEYS on the global env so a
 -- bare macro token never appears in real code (that would abort Luraph). Raw,
@@ -20,7 +20,7 @@ do
   end
 end
 
-local VERSION = 150
+local VERSION = 151
 
 local CFG = {
 
@@ -370,6 +370,13 @@ local CFG = {
 
     SnapDist = 3.0,
     Deadzone = 0.6,
+    -- НЕ ХОДИТЬ НА ТОГО, КОГО УЖЕ ДЕРЖИТ ТИММЕЙТ.
+    -- Вдвоём на одного — потерянный игрок: пока мы бежим к уже прикрытому
+    -- сопернику, второй остаётся свободным. Признаков «он защищает» три, и
+    -- все читаются с чужого персонажа: стойка (HoldingG), блок (Action) и
+    -- прыжок (InAir). Радиус — на каком расстоянии считаем, что он на нём.
+    SkipCovered = true,
+    CoveredRad  = 12.0,
     -- Скорость передвижения на защите, пишется в скорость напрямую.
     -- 0 = не вмешиваться и идти как игра позволяет (потолок 14 + спринт 3.35).
     MoveSpeed = 0,
@@ -500,7 +507,6 @@ local CFG = {
                BoxoutPlayer = 0, Call = 0, Retreat = 0,
                GoKart = 0, Sit = 0, TipOff = 0 },
 
-      FlattenAll = false,
     },
 
     Moves = {
@@ -6470,6 +6476,32 @@ local function findMovement()
   return HUB.mov
 end
 
+-- ЕГО УЖЕ ДЕРЖИТ ТИММЕЙТ.
+-- Возвращает того самого напарника и словами, чем он занят. Считаем прикрытым
+-- только если напарник НЕ ДАЛЬШЕ нас: если мы ближе, основной защитник всё-
+-- таки мы, и отдавать соперника было бы хуже, чем взять вдвоём.
+function PBX.coveredByMate(cp, myDist)
+  local D = CFG.Defense
+  if not (D.SkipCovered and cp) then return nil end
+  local rad = D.CoveredRad
+  for _, c in ipairs(charsList()) do
+    if isMate(c) then
+      local p = posOf(sChild(c, "HumanoidRootPart"))
+      if p then
+        local d = ((p - cp) * FLAT).Magnitude
+        if d <= rad and (not myDist or d <= myDist) then
+          if sAttr(c, "HoldingG") == true then return c, "in stance" end
+          local a = sAttr(c, "Action")
+          if a == "Blocking" then return c, "blocking" end
+          if a == "Stealing" then return c, "going for the steal" end
+          if sAttr(c, "InAir") == true then return c, "in the air on him" end
+        end
+      end
+    end
+  end
+  return nil
+end
+
 local function guardSpot(target, me)
   local D = CFG.Defense
   local tp = posOf(sChild(target, "HumanoidRootPart")); if not tp then return nil end
@@ -6565,6 +6597,7 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
 
   local hoopHere = (CFG.Defense.HoopRad > 0) and hoopWeDefend() or nil
   local target, bd, skipped = nil, nil, 0
+  local covered, coveredWhy = 0, nil
   for _, c in ipairs(charsList()) do
     if isEnemy(c) and hasBall(c) then
       local cp = posOf(sChild(c, "HumanoidRootPart"))
@@ -6577,7 +6610,16 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
           skipped += 1
         else
           local d = ((cp-me)*FLAT).Magnitude
-          if d <= CFG.Defense.Engage and (not bd or d < bd) then target, bd = c, d end
+          if d <= CFG.Defense.Engage then
+            local mate, doing = PBX.coveredByMate(cp, d)
+            if mate then
+              covered += 1
+              coveredWhy = ("%s already has %s (%s)")
+                :format(mate.Name, c.Name, tostring(doing))
+            elseif not bd or d < bd then
+              target, bd = c, d
+            end
+          end
         end
       end
     end
@@ -6588,7 +6630,13 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
   end
   if not target then
     defOff()
-    dbg("defense", "no enemy carrier within "..CFG.Defense.Engage.." stds")
+    if covered > 0 then
+      HUB.defWhy = "leaving him to the mate: " .. tostring(coveredWhy)
+      HUB.defCovered = (HUB.defCovered or 0) + 1
+      dbg("defense", HUB.defWhy)
+    else
+      dbg("defense", "no enemy carrier within "..CFG.Defense.Engage.." stds")
+    end
     return
   end
 
@@ -7251,6 +7299,8 @@ local function save()
     hideSprint = CFG.Zero.HideSprint, sprintHidden = HUB.sprintHidden,
     wantSprint = HUB.wantSprint,
     defOffLine = HUB.defOffLine, defLeadMax = CFG.Defense.LeadMax,
+    defSkipCovered = CFG.Defense.SkipCovered, defCoveredRad = CFG.Defense.CoveredRad,
+    defCovered = HUB.defCovered,
     defMoveSpeed = CFG.Defense.MoveSpeed,
     antiDribRange = CFG.AntiDef.DribbleRange, antiDribCD = CFG.AntiDef.DribbleCD,
     blatantJumpN = BL and BL.jumpN or nil,
@@ -7761,7 +7811,6 @@ end
 local function presetMul()
   local P = CFG.Move.Preset
   if not P.Enabled then return 1 end
-  if P.FlattenAll then return 1 / 1 end
   local m = HUB.mov
   local t = m and rawget(m, "CurrentMovementType")
   local mul = t and P.Mul[t]
@@ -8544,9 +8593,6 @@ return function(_Lib, _Core)
       slider(s1, { Name = "Ping Factor", Flag = "AG_PingCoef", Default = CFG.PingCoef,
         Min = 0.50, Max = 1.30, Precision = 2,
         Callback = function(v) CFG.PingCoef = v end })
-      bool(s1, "Measure Meter Speed", "read the real fill speed of each shot",
-        function() return CFG.UseFittedRate end,
-        function(v) CFG.UseFittedRate = v end)
       bool(s1, "Log Verdicts", nil,
         function() return CFG.Debug.Verdict end,
         function(v) CFG.Debug.Verdict = v end, "AG_Verdict")
@@ -8566,17 +8612,6 @@ return function(_Lib, _Core)
         Min = 10, Max = 60,
         Callback = function(v) CFG.Spoof.MinRealDist = v end,
         Desc = "shots nearer than this are left alone, the arc sits at 23.5" })
-      slider(s2, { Name = "Lead Time", Flag = "SP_PreTime", Default = CFG.Spoof.PreTime,
-        Min = 0.008, Max = 0.15, Precision = 3, Suffix = " s",
-        Callback = function(v) CFG.Spoof.PreTime = v end,
-        Desc = "how early you land there before the packet goes out" })
-      slider(s2, { Name = "Register Wait", Flag = "SP_HoldMax", Default = CFG.Spoof.HoldMax,
-        Min = 0.05, Max = 0.6, Precision = 2, Suffix = " s",
-        Callback = function(v) CFG.Spoof.HoldMax = v end,
-        Desc = "give up holding the fake spot after this long" })
-      bool(s2, "Wait For Register", "come back only once the server took the shot",
-        function() return CFG.Spoof.HoldUntilRegister end,
-        function(v) CFG.Spoof.HoldUntilRegister = v end)
       bool(s2, "Keep The 3", "never pull you inside the arc, that would cost a point",
         function() return CFG.Spoof.KeepThree end,
         function(v) CFG.Spoof.KeepThree = v end, "SP_Keep3")
@@ -8630,40 +8665,17 @@ return function(_Lib, _Core)
         local d = el and el._desc
         if d and d.SetVisibility then pcall(d.SetVisibility, d, CFG.S3.Mode == "Legit") end
       end
-      bool(s2b, "Hold Until Score", "keep the fake spot until the ball resolves",
-        function() return CFG.S3.Hold end,
-        function(v) CFG.S3.Hold = v end, "S3_Hold")
-      slider(s2b, { Name = "Score Wait", Flag = "S3_HoldMax", Default = CFG.S3.HoldMax,
-        Min = 0.5, Max = 3.0, Precision = 2, Suffix = " s",
-        Callback = function(v) CFG.S3.HoldMax = v end,
-        Desc = "the 2 or 3 call happens when the ball goes in, not on release" })
 
       s1:Divider()
       s1:Header({ Name = "Timing" })
       local s3 = s1
-      slider(s3, { Name = "Meter Speed Min", Flag = "AG_RateLo", Default = CFG.RateLo,
-        Min = 0.8, Max = 3.0, Precision = 2,
-        Callback = function(v) CFG.RateLo = v end,
-        Desc = "free throws fill at ~1.6, normal shots at ~3.1" })
-      slider(s3, { Name = "Meter Speed Max", Flag = "AG_RateHi", Default = CFG.RateHi,
-        Min = 3.0, Max = 6.0, Precision = 2,
-        Callback = function(v) CFG.RateHi = v end })
-      slider(s3, { Name = "Fallback Speed", Flag = "AG_RateFlat", Default = CFG.RateFlat,
-        Min = 2.5, Max = 4.0, Precision = 2,
-        Callback = function(v) CFG.RateFlat = v end })
       slider(s3, { Name = "Max Hold", Flag = "AG_MaxWait", Default = CFG.MaxWait,
         Min = 0.6, Max = 2.0, Precision = 2, Suffix = " s",
         Callback = function(v) CFG.MaxWait = v end })
-      slider(s3, { Name = "Arm Window", Flag = "AG_ArmWindow", Default = CFG.ArmWindow,
-        Min = 0.2, Max = 1.5, Precision = 2, Suffix = " s",
-        Callback = function(v) CFG.ArmWindow = v end })
       slider(s3, { Name = "Fire Early Limit", Flag = "AG_TickEarly", Default = CFG.TickEarly,
         Min = 0, Max = 0.5, Precision = 2,
         Callback = function(v) CFG.TickEarly = v end,
         Desc = "in meter ticks. 0.5 was the old behaviour and it undershot, 0 fires dead on target" })
-      slider(s3, { Name = "Spin Window", Flag = "AG_Spin", Default = CFG.SpinWindow,
-        Min = 0.005, Max = 0.05, Precision = 3, Suffix = " s",
-        Callback = function(v) CFG.SpinWindow = v end })
 
       local s6 = T:Section({ Side = "Right" })
       feature(s6, {
@@ -8673,10 +8685,6 @@ return function(_Lib, _Core)
       })
       s6:SubLabel({ Text = "contest builds up while a defender covers you" })
       local adShow
-      bool(s6, "Dodge Before Shot",
-        "break away between your press and the shot leaving",
-        function() return CFG.AntiDef.PreShot end,
-        function(v) CFG.AntiDef.PreShot = v end)
       s6:Dropdown({
         Name = "Dodge Mode", Options = { "Legit", "BackTP", "Teleport", "Permanent" },
         Default = CFG.AntiDef.Mode, Required = true,
@@ -8697,10 +8705,6 @@ return function(_Lib, _Core)
         Min = 6, Max = 40, Precision = 1,
         Callback = function(v) CFG.AntiDef.StopAt = v end,
         Desc = "this much room is enough, stop trying for more" })
-      bool(s6, "Count Stance As Closer",
-        "a defender holding G is the one that actually hurts, run from him first",
-        function() return CFG.AntiDef.Stance end,
-        function(v) CFG.AntiDef.Stance = v end, "AD_Stance")
 
       -- НАСТРОЙКИ РЕЖИМА ПОКАЗЫВАЮТСЯ ТОЛЬКО ДЛЯ ВЫБРАННОГО РЕЖИМА.
       -- Раньше на экране висели разом все четыре набора, и понять, какой из
@@ -8851,12 +8855,6 @@ return function(_Lib, _Core)
             PBX.sprintSend(HUB.wantSprint == true)
           end
         end, "ZS_HideSprint")
-      bool(s5, "Whole Shot", "stand from the shot start, not only at release",
-        function() return CFG.Zero.FromStart end,
-        function(v) CFG.Zero.FromStart = v end, "ZS_FromStart")
-      slider(s5, { Name = "Stand Before", Flag = "ZS_Lead", Default = CFG.Zero.Lead,
-        Min = 0.05, Max = 0.6, Precision = 2, Suffix = " s",
-        Callback = function(v) CFG.Zero.Lead = v end })
       slider(s5, { Name = "Stand After", Flag = "ZS_Tail", Default = CFG.Zero.Tail,
         Min = 0, Max = 0.4, Precision = 2, Suffix = " s",
         Callback = function(v) CFG.Zero.Tail = v end })
@@ -8900,12 +8898,6 @@ return function(_Lib, _Core)
         end
       })
       s1:Dropdown({
-        Name = "Mode", Options = { "Auto", "Hook" },
-        Default = CFG.Defense.Mode, Required = true,
-        Callback = function(v) if type(v) == "string" then CFG.Defense.Mode = v end end,
-      }, ctx.flag("DEF_Mode"))
-      s1:SubLabel({ Text = "Hook only redirects your own movement" })
-      s1:Dropdown({
         Name = "Face", Options = { "Off", "Enemy", "Ball" },
         Default = CFG.Face.Mode, Required = true,
         Callback = function(v) if type(v) == "string" then CFG.Face.Mode = v end end,
@@ -8917,6 +8909,14 @@ return function(_Lib, _Core)
       slider(s1, { Name = "Turn Smoothing", Flag = "DEF_FaceSmooth", Default = CFG.Face.Smooth,
         Min = 0.05, Max = 1, Precision = 2,
         Callback = function(v) CFG.Face.Smooth = v end })
+      bool(s1, "Leave Covered Men",
+        "skip an attacker your teammate is already guarding, go find the free one",
+        function() return CFG.Defense.SkipCovered end,
+        function(v) CFG.Defense.SkipCovered = v end, "DEF_SkipCovered")
+      slider(s1, { Name = "Counts As Covered", Flag = "DEF_CoveredRad",
+        Default = CFG.Defense.CoveredRad, Min = 4, Max = 25, Precision = 1,
+        Callback = function(v) CFG.Defense.CoveredRad = v end,
+        Desc = "how close the mate has to be, and he must be no further than you" })
       slider(s1, { Name = "Walk Around Him", Flag = "DEF_Around", Default = CFG.Defense.WalkAround,
         Min = 0, Max = 8, Precision = 1,
         Callback = function(v) CFG.Defense.WalkAround = v end,
@@ -8978,9 +8978,6 @@ return function(_Lib, _Core)
         Min = 0, Max = 0.5, Precision = 2, Suffix = " s",
         Callback = function(v) CFG.Grab.LeadTime = v end })
 
-      bool(s3, "Only My Hoop", "ignore shots aimed at the enemy hoop",
-        function() return CFG.Grab.GoalCheck end,
-        function(v) CFG.Grab.GoalCheck = v end)
       bool(s3, "Only In Match", "do nothing in lobby, warmup or while spectating",
         function() return CFG.Grab.OnlyInMatch end,
         function(v) CFG.Grab.OnlyInMatch = v end)
@@ -9009,9 +9006,6 @@ return function(_Lib, _Core)
         Min = 0, Max = 1, Precision = 2,
         Callback = function(v) CFG.Grab.CatchLead = v end,
         Desc = "walk this far past the catch point along the arc, 0 stands on it" })
-      slider(s3, { Name = "Catch Lookahead", Flag = "GRAB_CatchAhead", Default = CFG.Grab.CatchAhead,
-        Min = 0.5, Max = 3, Precision = 1, Suffix = " s",
-        Callback = function(v) CFG.Grab.CatchAhead = v end })
       bool(s3, "Rim Guard", "also swat balls flying near your rim",
         function() return CFG.Grab.RimGuard end,
         function(v) CFG.Grab.RimGuard = v end)
@@ -9026,9 +9020,6 @@ return function(_Lib, _Core)
       slider(s3, { Name = "Rim Guard Reach", Flag = "GRAB_ReachXZ", Default = CFG.Grab.ReachXZ,
         Min = 2, Max = 14,
         Callback = function(v) CFG.Grab.ReachXZ = v end })
-      slider(s3, { Name = "Bait Guard", Flag = "GRAB_MinCommit", Default = CFG.Grab.MinCommit,
-        Min = 0, Max = 0.4, Precision = 2, Suffix = " s",
-        Callback = function(v) CFG.Grab.MinCommit = v end })
       slider(s3, { Name = "Camp Radius", Flag = "GRAB_CampRad", Default = CFG.Grab.CampRad,
         Min = 0, Max = 40,
         Callback = function(v) CFG.Grab.CampRad = v end })
@@ -9093,12 +9084,6 @@ return function(_Lib, _Core)
         Min = 8, Max = 60,
         Callback = function(v) CFG.Blatant.HoopRad = v end,
         Desc = "ignore shooters farther than this from our hoop" })
-      bool(s4, "Engage On Windup", "step in on the gather, the shot packet is already half a ping late",
-        function() return CFG.Blatant.OnWindup end,
-        function(v) CFG.Blatant.OnWindup = v end, "BL_Windup")
-      bool(s4, "Hold Stance", "near costs him accuracy, in stance costs him the shot",
-        function() return CFG.Blatant.HoldG end,
-        function(v) CFG.Blatant.HoldG = v end)
       slider(s4, { Name = "Jump Window", Flag = "BL_JumpWin", Default = CFG.Blatant.JumpWindow,
         Min = 0.1, Max = 1.2, Precision = 2, Suffix = " s",
         Callback = function(v) CFG.Blatant.JumpWindow = v end,
@@ -9225,9 +9210,6 @@ return function(_Lib, _Core)
         set = function(v) CFG.Move.Preset.Enabled = v; mv(v) end,
         Desc = "rewrites speed and turning per movement state"
       })
-      bool(s10, "Remove All Slowdowns", nil,
-        function() return CFG.Move.Preset.FlattenAll end,
-        function(v) CFG.Move.Preset.FlattenAll = v end)
       -- Тот же список, что игра присваивает CurrentMovementType.
       local presetNames = { "Base", "Guard", "Post", "Boxout", "BoxoutPlayer",
                             "Call", "Retreat", "TipOff", "GoKart", "Sit" }
@@ -9290,10 +9272,20 @@ return function(_Lib, _Core)
         set = function(v) CFG.Move.Slip.Enabled = v; if v then installMoveHook() end end,
         Desc = "a bump stuns you for 0.38 s, so it never lets you touch them"
       })
+      -- НАСТРОЙКИ РЕЖИМА ПОКАЗЫВАЮТСЯ ТОЛЬКО ДЛЯ ВЫБРАННОГО РЕЖИМА.
+      -- Тот же приём, что в Anti Defense. Здесь он нужнее всего: десять из
+      -- четырнадцати ползунков читает ТОЛЬКО ветка Feint, и в режиме Default
+      -- они висели на экране, ничего не делая.
+      local slipFeint = {}
+      local slipShow
       s13:Dropdown({
         Name = "Slip Mode", Options = { "Default", "Feint" },
         Default = CFG.Move.Slip.Mode, Required = true,
-        Callback = function(v) if type(v) == "string" then CFG.Move.Slip.Mode = v end end,
+        Callback = function(v)
+          if type(v) ~= "string" then return end
+          CFG.Move.Slip.Mode = v
+          if slipShow then slipShow(v) end
+        end,
       }, ctx.flag("MV_SlipMode"))
       s13:SubLabel({ Text = "Default dodges one man | Feint reads him and cuts back" })
       slider(s13, { Name = "Rim Free Zone", Flag = "MV_RimFree", Default = CFG.Move.RimFree,
@@ -9304,10 +9296,6 @@ return function(_Lib, _Core)
         Min = 1.2, Max = 4.0, Precision = 2,
         Callback = function(v) CFG.Move.Slip.StartMul = v end,
         Desc = "in contact radii, 2.0 is about five stds, lower starts later" })
-      bool(s13, "Skip When Contact Is Off",
-        "on a dunk, layup, pass or shot the game does not shove at all, so walk straight through",
-        function() return CFG.Move.Slip.SkipNoContact end,
-        function(v) CFG.Move.Slip.SkipNoContact = v end, "MV_SlipSkip")
       slider(s13, { Name = "Slip Angle", Flag = "MV_SlipAngle", Default = CFG.Move.Slip.Angle,
         Min = 9, Max = 40,
         Callback = function(v) CFG.Move.Slip.Angle = v end,
@@ -9316,45 +9304,55 @@ return function(_Lib, _Core)
         Min = 0, Max = 80,
         Callback = function(v) CFG.Move.Slip.LookDeg = v end,
         Desc = "eyes off the man in stance, facing him is what invites the push" })
-      slider(s13, { Name = "Stance Range", Flag = "MV_StanceRange", Default = CFG.Move.Slip.StanceRange,
+      slipFeint[#slipFeint+1] = slider(s13, { Name = "Stance Range", Flag = "MV_StanceRange", Default = CFG.Move.Slip.StanceRange,
         Min = 6, Max = 24, Precision = 1,
         Callback = function(v) CFG.Move.Slip.StanceRange = v end,
         Desc = "a man in stance this close makes it start looking for space" })
-      slider(s13, { Name = "Keep Away", Flag = "MV_SlipKeep", Default = CFG.Move.Slip.KeepGap,
+      slipFeint[#slipFeint+1] = slider(s13, { Name = "Keep Away", Flag = "MV_SlipKeep", Default = CFG.Move.Slip.KeepGap,
         Min = 4, Max = 24, Precision = 1,
         Callback = function(v) CFG.Move.Slip.KeepGap = v end,
         Desc = "same trigger for anyone not in stance" })
-      slider(s13, { Name = "Open Enough", Flag = "MV_Open", Default = CFG.Move.Slip.Open,
+      slipFeint[#slipFeint+1] = slider(s13, { Name = "Open Enough", Flag = "MV_Open", Default = CFG.Move.Slip.Open,
         Min = 6, Max = 30,
         Callback = function(v) CFG.Move.Slip.Open = v end,
         Desc = "past this he no longer contests, so no reason to run further" })
-      slider(s13, { Name = "Step Out", Flag = "MV_StepOut", Default = CFG.Move.Slip.StepOut,
+      slipFeint[#slipFeint+1] = slider(s13, { Name = "Step Out", Flag = "MV_StepOut", Default = CFG.Move.Slip.StepOut,
         Min = 5, Max = 22,
         Callback = function(v) CFG.Move.Slip.StepOut = v end,
         Desc = "how far ahead the candidate spots sit" })
-      slider(s13, { Name = "Follow Input", Flag = "MV_InputW", Default = CFG.Move.Slip.InputWeight,
+      slipFeint[#slipFeint+1] = slider(s13, { Name = "Follow Input", Flag = "MV_InputW", Default = CFG.Move.Slip.InputWeight,
         Min = 0, Max = 3, Precision = 2,
         Callback = function(v) CFG.Move.Slip.InputWeight = v end,
         Desc = "0 goes purely for space, high keeps your own direction" })
-      slider(s13, { Name = "Max Turn", Flag = "MV_MaxTurn", Default = CFG.Move.Slip.MaxTurn,
+      slipFeint[#slipFeint+1] = slider(s13, { Name = "Max Turn", Flag = "MV_MaxTurn", Default = CFG.Move.Slip.MaxTurn,
         Min = 15, Max = 85,
         Callback = function(v) CFG.Move.Slip.MaxTurn = v end,
         Desc = "hard cap on how far it may bend you off your own keys" })
-      slider(s13, { Name = "Commit", Flag = "MV_FeintCommit", Default = CFG.Move.Slip.CommitTime,
+      slipFeint[#slipFeint+1] = slider(s13, { Name = "Commit", Flag = "MV_FeintCommit", Default = CFG.Move.Slip.CommitTime,
         Min = 0.08, Max = 0.8, Precision = 2, Suffix = " s",
         Callback = function(v) CFG.Move.Slip.CommitTime = v end,
         Desc = "how long a chosen lane is favoured, short jitters" })
-      bool(s13, "Fake The Look", "eyes turn away from the run so it is not telegraphed",
+      slipFeint[#slipFeint+1] = bool(s13, "Fake The Look",
+        "eyes turn away from the run so it is not telegraphed",
         function() return CFG.Move.Slip.LookFake end,
         function(v) CFG.Move.Slip.LookFake = v end, "MV_LookFake")
-      slider(s13, { Name = "Look Angle", Flag = "MV_LookOff", Default = CFG.Move.Slip.LookOff,
+      slipFeint[#slipFeint+1] = slider(s13, { Name = "Look Angle", Flag = "MV_LookOff", Default = CFG.Move.Slip.LookOff,
         Min = 0, Max = 70,
         Callback = function(v) CFG.Move.Slip.LookOff = v end,
         Desc = "past 41 the game starts cutting speed unless Strafer is on" })
-      slider(s13, { Name = "Zone Radius", Flag = "MV_ZoneRad", Default = CFG.Move.Slip.ZoneRad,
+      slipFeint[#slipFeint+1] = slider(s13, { Name = "Zone Radius", Flag = "MV_ZoneRad", Default = CFG.Move.Slip.ZoneRad,
         Min = 8, Max = 45,
         Callback = function(v) CFG.Move.Slip.ZoneRad = v end,
         Desc = "further than this from the rim it stops feinting entirely" })
+
+      function slipShow(mode)
+        for _, el in ipairs(slipFeint) do
+          if el and el.SetVisibility then pcall(el.SetVisibility, el, mode == "Feint") end
+          local d = el and el._desc
+          if d and d.SetVisibility then pcall(d.SetVisibility, d, mode == "Feint") end
+        end
+      end
+      slipShow(CFG.Move.Slip.Mode)
 
       local s11 = T:Section({ Side = "Left" })
       feature(s11, {
@@ -9495,18 +9493,6 @@ return function(_Lib, _Core)
       slider(s2, { Name = "Min Speed", Flag = "MS_MinSpeed", Default = CFG.Traj.MinSpeed,
         Min = 1, Max = 30,
         Callback = function(v) CFG.Traj.MinSpeed = v end })
-      slider(s2, { Name = "Hold Distance", Flag = "MS_HoldDist", Default = CFG.Traj.HoldDist,
-        Min = 3, Max = 14,
-        Callback = function(v) CFG.Traj.HoldDist = v end })
-      slider(s2, { Name = "Ball Poll", Flag = "MS_TagEvery", Default = CFG.Traj.TagEvery,
-        Min = 0.05, Max = 1.0, Precision = 2, Suffix = " s",
-        Callback = function(v) CFG.Traj.TagEvery = v end })
-      slider(s2, { Name = "Deep Scan", Flag = "MS_ScanEvery", Default = CFG.Traj.ScanEvery,
-        Min = 1, Max = 10, Suffix = " s",
-        Callback = function(v) CFG.Traj.ScanEvery = v end })
-      slider(s2, { Name = "Flight Hold", Flag = "MS_FlightHold", Default = CFG.Traj.FlightHold,
-        Min = 0.05, Max = 0.6, Precision = 2, Suffix = " s",
-        Callback = function(v) CFG.Traj.FlightHold = v end })
     end
 
     do
