@@ -1,4 +1,4 @@
---[[ PRACTICAL BASKETBALL v152 — Potassium/UNC — модуль для лоадера Syllinse ]]
+--[[ PRACTICAL BASKETBALL v155 — Potassium/UNC — модуль для лоадера Syllinse ]]
 
 -- Luraph macro prelude. Installed through STRING KEYS on the global env so a
 -- bare macro token never appears in real code (that would abort Luraph). Raw,
@@ -20,7 +20,7 @@ do
   end
 end
 
-local VERSION = 152
+local VERSION = 155
 
 local CFG = {
 
@@ -296,6 +296,8 @@ local CFG = {
     OnlyInMatch = true,
 
     ShotHold   = 1.60,
+    -- Запасное значение, если рост прочитать не удалось. Считается по
+    -- формуле игры (JP.armReach) из роста и размаха рук.
     ArmReach   = 3.5,
 
     NoJumpDy   = 2.2,
@@ -390,6 +392,9 @@ local CFG = {
     -- Насколько напарник может стоять в стороне от прямой «носитель —
     -- наше кольцо» и всё ещё считаться закрывающим проход.
     CoveredLane = 4.0,
+    -- Сколько держим уже принятое решение «его ведёт напарник». Без этого
+    -- выбор мигает каждый кадр вместе с его стойкой, и мы дёргаемся на месте.
+    CoveredHold = 1.5,
     -- Скорость передвижения на защите, пишется в скорость напрямую.
     -- 0 = не вмешиваться и идти как игра позволяет (потолок 14 + спринт 3.35).
     MoveSpeed = 0,
@@ -1331,10 +1336,23 @@ function PBX.ballDead()
     D.v, D.why = true, "the ball is out of bounds"
     return D.v, D.why
   end
-  local w = CFG.Grab.DeadAfterScore
-  if w > 0 and HUB.scoredAt and (now - HUB.scoredAt) < w then
-    D.v, D.why = true, ("the ball just went in, %.1f s left"):format(w - (now - HUB.scoredAt))
-    return D.v, D.why
+  -- ПОСЛЕ ГОЛА МЯЧ МЁРТВ НЕ ФИКСИРОВАННОЕ ОКНО, А ПОКА ЕГО НЕ ПОДНИМУТ.
+  -- Он проваливается в сетку, падает, катится, и только потом кто-то идёт
+  -- за ним на вбрасывание. Уложить это в 2.6 с нельзя — бывает и шесть.
+  -- Ждём появления владельца, с нижней границей (чтобы мигание владельца
+  -- не разблокировало раньше времени) и верхней (предохранитель).
+  if HUB.scoredAt then
+    local since = now - HUB.scoredAt
+    local w = CFG.Grab.DeadAfterScore
+    if since < w then
+      D.v, D.why = true, ("scored %.1f s ago"):format(since)
+      return D.v, D.why
+    end
+    if HUB.ballHolder == nil and since < (CFG.Grab.DeadMax or 8) then
+      D.v, D.why = true, "scored, nobody has picked the ball up yet"
+      return D.v, D.why
+    end
+    HUB.scoredAt = nil
   end
   for _, c in ipairs(charsList()) do
     if PBX.inSameMatch(c) then
@@ -2319,26 +2337,30 @@ local function spoofShot(g, startArgs)
   -- Синхронный вызов заставлял бросок ждать весь отшаг. Смысла в такой
   -- очерёдности нет: контест сервер считает на РЕГИСТРАЦИИ броска, значит
   -- отойти надо к этому моменту, а не до отправки.
-  if PBX.legitStep then task.spawn(PBX.legitStep, g, hp) end
-
-  -- ОТШАГ И ПОДМЕНА ПОЗИЦИИ ДЕРУТСЯ ЗА ОДНО ТЕЛО, И РАНЬШЕ ПОДМЕНА ПРОСТО
-  -- НЕ ПРОИСХОДИЛА. ВОТ ПОЧЕМУ «SPOOF DISTANCE НЕ РАБОТАЕТ».
-  -- Проверка «не телепортируй, пока идёт отшаг» стояла на КАЖДОМ вызове
-  -- tpProxy — и на первом, и во всём цикле удержания. Отшаг живёт
-  -- StepTime = 0.22 с, а до отправки броска мы ждём PreTime = 0.03 с. То
-  -- есть при включённом режиме Legit подмена не срабатывала НИ РАЗУ: пакет
-  -- броска уходил из настоящей точки. В дампе это видно прямо — у каждого
-  -- броска есть строка retreat, а exposureMs считался от телепорта, которого
-  -- не было. Правильный порядок: сначала ноги, потом показ серверу. Ждём
-  -- только пока отшаг реально идёт, и не дольше его собственного бюджета.
-  if HUB.antiStepUntil then
-    local wEnd = os.clock() + CFG.AntiDef.StepTime + 0.12
-    while HUB.running and HUB.gen == g
-          and HUB.antiStepUntil and os.clock() < HUB.antiStepUntil
-          and os.clock() < wEnd do
-      RunService.Heartbeat:Wait()
+  -- РЫВОК И ПОДМЕНА ПОЗИЦИИ — ВЕЩИ ВЗАИМОИСКЛЮЧАЮЩИЕ, И ЖДАТЬ НЕЛЬЗЯ.
+  -- В прошлой версии я заставлял бросок ЖДАТЬ окончания отшага, чтобы уже
+  -- потом показать серверу точку. Отшаг живёт StepTime, в дампе это 274 мс,
+  -- и всё это время игрок просто держит кнопку. Это и есть «очень долгое
+  -- ожидание перед выстрелом». Ждать нельзя.
+  -- Совместить их тоже нельзя: tpProxy обнуляет скорость и переставляет
+  -- BodyPosition, то есть стирает уход, а уход в ответ пишет скорость поверх
+  -- подмены — два владельца одного тела.
+  -- Значит выбираем ОДНО. Побеждает рывок: он снимает контест, а это прямой
+  -- штраф к точности. Подмена лишь расширяет окно грина, а по этому дампу мы
+  -- и так попадаем в него 4 из 4. Отшаг запускается параллельно и НЕ
+  -- задерживает бросок ни на кадр.
+  local dodging = false
+  do
+    local A = CFG.AntiDef
+    local phys = A.Enabled and A.PreShot
+                 and (A.Mode == "Legit" or A.Mode == "BackTP")
+    if phys and PBX.legitStep then
+      -- task.spawn выполняет функцию до первой уступки, поэтому решение
+      -- «ушёл или нет» известно сразу после этой строки.
+      HUB.antiActive = nil
+      task.spawn(PBX.legitStep, g, hp)
+      dodging = (HUB.antiActive ~= nil)
     end
-    HUB.spoofWaited = (HUB.spoofWaited or 0) + 1
   end
 
   if HUB.gen ~= g then
@@ -2448,6 +2470,10 @@ local function spoofShot(g, startArgs)
     end
   end
 
+  if dodging then
+    HUB.spoofWhy = "the physical dodge is running, no position swap this shot"
+    return plain()
+  end
   if s3Walk then
     -- Уходим за дугу НОГАМИ: подменять позицию в этот же бросок нельзя,
     -- tpProxy обнулит скорость и сотрёт весь уход.
@@ -2939,6 +2965,7 @@ local updateBall = LPH_NO_VIRTUALIZE(function()
     BALL.state = "flight"
     BALL.tSeen = now
     BALL.holder = holderOf(best.pos)
+    HUB.ballHolder = BALL.holder
     if BALL.holder then
       BALL.shooter = BALL.holder
       -- ЧЕМ ЗАНЯТ ВЛАДЕЛЕЦ, ПОКА МЯЧ ЕЩЁ У НЕГО В РУКАХ.
@@ -2996,6 +3023,7 @@ local updateBall = LPH_NO_VIRTUALIZE(function()
     else
       BALL.holder = nil
     end
+    HUB.ballHolder = BALL.holder
     BALL.state, BALL.speed = "idle", 0
   end
   BALL.lastTick = now
@@ -3701,6 +3729,77 @@ end
 
 local JP = {}
 
+-- РОСТ И РАЗМАХ РУК БЕРЁМ ИЗ САМОЙ ИГРЫ, А НЕ ИЗ КОНСТАНТЫ.
+-- В сборке персонажа они лежат одной таблицей: Config.Teams.Players[*].Vitals
+-- это { Height, Weight, Wingspan, BodyType }, и та же тройка используется у
+-- игрока. Ищем её по набору ключей — так же, как ищем Movement и charComp.
+function PBX.getVitals()
+  local v = PBX.vitals
+  if v and type(rawget(v, "Height")) == "number" then return v end
+  if not filtergc then return nil end
+  if (os.clock() - (PBX.vitalsAt or -99)) < 5 then return nil end
+  PBX.vitalsAt = os.clock()
+  local ok, t = pcall(filtergc, "table",
+    { Keys = { "Height", "Wingspan", "BodyType" } }, true)
+  PBX.vitals = (ok and type(t) == "table") and t or nil
+  return PBX.vitals
+end
+
+-- ВЫСОТА ВЫТЯНУТОЙ РУКИ СТОЯ — ФОРМУЛОЙ САМОЙ ИГРЫ.
+-- Modules.AnimationViewer.Scenarios.Dunk, функция GetStandingReach:
+--   reach = 3.85 * (1.135 + (Height - 69) * 0.025) + (Wingspan - Height) * 1.2/12
+-- Рост и размах в ДЮЙМАХ, 69 это базовые 5'9". Что формула даёт студы мира,
+-- видно там же строкой ниже: рядом стоит высота кольца 9.306, и из неё этот
+-- reach вычитается напрямую.
+-- Одна поправка. Формула считает от ПОЛА, а все наши dy — от
+-- HumanoidRootPart. Разницу не угадываем: меряем высоту корня над полом тем
+-- же лучом вниз, которым ищем пол для траектории. Для текущей сборки
+-- (рост 85) это даёт ровно те 3.5, что стояли константой, а для низкого
+-- билда — почти на студ меньше. Ровно та разница, из-за которой перехват
+-- у одних работал, а у других нет.
+function JP.armReach()
+  local now = os.clock()
+  if HUB.armReach and (now - (HUB.armReachAt or 0)) < 3 then return HUB.armReach end
+
+  local h = sAttr(chr(), "Height")
+  local w = nil
+  local vit = PBX.getVitals()
+  if vit then
+    local vh, vw = rawget(vit, "Height"), rawget(vit, "Wingspan")
+    if type(vh) == "number" then h = vh end
+    if type(vw) == "number" then w = vw end
+  end
+  if type(h) ~= "number" or h < 50 or h > 110 then
+    HUB.armReachSrc = "no height on the build, keeping the constant"
+    return CFG.Grab.ArmReach
+  end
+  if type(w) ~= "number" or w < 50 or w > 120 then w = h end
+  local floorReach = 3.85 * (1.135 + (h - 69) * 0.025) + (w - h) * 1.2 / 12
+
+  -- Высоту корня над полом ОБЯЗАТЕЛЬНО меряем, а не берём коэффициентом:
+  -- она сама зависит от роста, и подобранное для одной сборки число для
+  -- другой было бы неверным. Не удалось померить — остаёмся на константе,
+  -- потому что floorReach без этой поправки завышен почти вдвое.
+  local me = selfPos()
+  local gy = me and PBX.groundUnder(me) or nil
+  if not (me and type(gy) == "number") then
+    HUB.armReachSrc = "floor under us not found, keeping the constant"
+    return CFG.Grab.ArmReach
+  end
+  local root = me.Y - gy
+  if not (root > 0.5 and root < 8) then
+    HUB.armReachSrc = ("root height %.2f looks wrong, keeping the constant"):format(root)
+    return CFG.Grab.ArmReach
+  end
+
+  local reach = math.clamp(floorReach - root, 2.0, 6.0)
+  HUB.armReach, HUB.armReachAt = reach, now
+  HUB.armReachH, HUB.armReachW, HUB.armReachRoot = h, w, root
+  HUB.armReachSrc = ("height %.0f, wingspan %.0f, stands %.2f, root %.2f")
+    :format(h, w, floorReach, root)
+  return reach
+end
+
 function JP.jumpV0()
   local g = Workspace.Gravity
   local apex = (HUB.jumpApex and (HUB.jumpApexN or 0) >= CFG.Grab.ApexMinN)
@@ -3711,10 +3810,10 @@ end
 function JP.reachY()
   local r
   if HUB.jumpApex and (HUB.jumpApexN or 0) >= CFG.Grab.ApexMinN then
-    r = HUB.jumpApex + CFG.Grab.ArmReach
+    r = HUB.jumpApex + JP.armReach()
   else
 
-    r = CFG.Grab.ApexGuess + CFG.Grab.ArmReach
+    r = CFG.Grab.ApexGuess + JP.armReach()
   end
 
   if CFG.Grab.ReachSet and CFG.Grab.ReachSet > 0 then return CFG.Grab.ReachSet end
@@ -3794,7 +3893,7 @@ function JP.measureJumpLag(t0, y0)
 end
 
 function JP.bodyRise(dy)
-  return JP.riseTo(math.max((dy or 0) - CFG.Grab.ArmReach, 0))
+  return JP.riseTo(math.max((dy or 0) - JP.armReach(), 0))
 end
 
 -- КОГДА МЯЧ ВОЙДЁТ В ЗОНУ ХВАТА — ПО НАСТОЯЩЕЙ ТРАЕКТОРИИ.
@@ -3837,7 +3936,7 @@ function JP.watchArrival(P, tPred, dy)
   if not (P and tPred) then return end
   local t0 = os.clock()
   local me0 = selfPos(); local y0 = me0 and me0.Y or 0
-  local need = math.max((dy or 0) - CFG.Grab.ArmReach, 0)
+  local need = math.max((dy or 0) - JP.armReach(), 0)
   task.spawn(function()
     local bestD, bestT, handsAt = nil, nil, nil
     local deadline = t0 + tPred + 0.9
@@ -4534,6 +4633,12 @@ local function steerToDir(dir, sprint, owner, silent)
     HUB.moveWorld = dir
     HUB.moveAt = os.clock()
     HUB.moveOwner = owner or "?"
+    -- КТО И СКОЛЬКО РАЗ НАС ВЁЛ.
+    -- Чтобы в следующий раз не гадать, какая система тянет: в дампе будет
+    -- строка с разбивкой по владельцам.
+    local sN = HUB.steerN; if not sN then sN = {}; HUB.steerN = sN end
+    local sk = owner or "?"
+    sN[sk] = (sN[sk] or 0) + 1
 
     HUB.moveNeedInput = (owner == "defense") and (CFG.Defense.Mode == "Hook")
     HUB.moveSrc = tostring(HUB.pmSrc)
@@ -4885,6 +4990,10 @@ function PBX.legitStep(g, hp)
   end
 
   local t0 = os.clock()
+  -- Отмечаем, что уход СОСТОЯЛСЯ. Читается синхронно сразу после task.spawn:
+  -- корутина выполняется до первой уступки, а она ниже по коду.
+  HUB.antiActive = t0
+  HUB.antiActiveN = (HUB.antiActiveN or 0) + 1
 
   -- ДРИББЛ-ОТХОД ОТСЮДА УБРАН, И ВОТ ПОЧЕМУ ОН НИКОГДА НЕ СРАБАТЫВАЛ.
   -- Здесь стояло условие "A.Dribble and R.Drib and not PBX.shotBusy()".
@@ -5707,6 +5816,18 @@ track(RunService.Heartbeat:Connect(function(dt)
   local carrierShooting = carrier and PBX.isShot(carrier) or false
   if not spot and carrier and (carrierShooting or CFG.Defense.Enabled) then
     local cp = posOf(sChild(carrier, "HumanoidRootPart"))
+    -- ВОТ ЭТА ВЕТКА И ТЯНУЛА НА ПРИКРЫТОГО.
+    -- Она ведёт «на носителя» или «на бросающего» и до сих пор не смотрела,
+    -- держит ли его кто-то из наших. Auto Move в дампе включён, а проверку я
+    -- поставил только в Auto Defense — поэтому фикс и не помог.
+    if cp and PBX.leaveToMate then
+      local mate, doing = PBX.leaveToMate(carrier, cp)
+      if mate then
+        HUB.autoWhy = ("leaving %s to %s (%s)")
+          :format(carrier.Name, mate.Name, tostring(doing))
+        cp = nil
+      end
+    end
     if cp then
       local v = charVel(carrier) * CFG.Grab.LeadTime
       local ahead = cp + Vector3.new(v.X, 0, v.Z)
@@ -5993,7 +6114,16 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
         local fe = fpool[fi]
         local c = fe.c
         local k = PBX.shotKind(c)
-        if (k == "rim" or k == "windup") and fe.ball then
+        -- НА ДАНКЕ МЯЧ УЖЕ НЕ В РУКАХ, И ЭТО ЛОМАЛО ВСЮ ВЕТКУ ЦЕЛИКОМ.
+        -- fe.ball читает атрибут Basketball. Игра снимает его в момент
+        -- данка — Mobile:75 и Visual:112 перечисляют Dunking ОТДЕЛЬНО именно
+        -- потому, что Basketball там уже false. То есть условие «атака
+        -- кольца И мяч в руках» на настоящем данке не выполнялось НИКОГДА.
+        -- Доказательство в дампе: за всю сессию в grabStats нет ни одного
+        -- "rim attack jump" и ни одного "rim attack closing". Ветка мертва,
+        -- и кольцо от данков не защищалось вообще.
+        -- Замах (windup) мяч ещё держит, там проверка осмысленна.
+        if (k == "rim") or (k == "windup" and fe.ball) then
           local cp = fe.p
           if cp then
             local toHoop = ((cp - hp) * FLAT).Magnitude
@@ -6015,6 +6145,19 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
                 return
               else
 
+                -- На атаку кольца уступаем только ЖИВОМУ противодействию:
+                -- напарник в прыжке или в блоке. Просто стоящий рядом — нет,
+                -- данк это самое дорогое, что можно накрыть.
+                -- Присваивание в ДВЕ переменные из выражения and/or даёт
+                -- второй всегда nil: оно сжимается до одного значения.
+                local mate, doing
+                if PBX.leaveToMate then mate, doing = PBX.leaveToMate(c, cp, true) end
+                if mate then
+                  PBX.why("blockWhy", "%s is already up on %s (%s)",
+                          mate.Name, c.Name, tostring(doing))
+                  stopSteerSoft("grab")
+                  return
+                end
                 steerTo(cp, "grab")
                 faceBall(cp, dt)
                 PBX.why("blockWhy", "rim attack: %s at %.1f from hoop, closing %.1f",
@@ -6260,6 +6403,15 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
             return
           end
         end
+        -- Его уже накрывает напарник — второй контест ничего не добавит.
+        local mate, doing
+        if PBX.leaveToMate then mate, doing = PBX.leaveToMate(c, cp) end
+        if mate then
+          PBX.why("blockWhy", "leaving %s to %s (%s)",
+                  c.Name, mate.Name, tostring(doing))
+          stopSteerSoft("grab")
+          return
+        end
         steerTo(spot, "grab")
         faceBall(ahead, dt)
         return
@@ -6400,7 +6552,7 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
         local eff = math.max(run - CFG.Grab.CatchBody, 0)
 
         local need = eff / speed
-        if dy > CFG.Grab.ArmReach then
+        if dy > JP.armReach() then
           -- ПОДЪЁМ СТОИТ НЕ ТОЛЬКО ПОЛЁТА ТЕЛА, НО И ЛАГА ПРЫЖКА.
           -- Прыжок уходит ремоутом на сервер и возвращается: замеренный лаг
           -- в дампах 0.40..0.51 с. Без него расчёт говорит "успеваем", мы
@@ -6411,7 +6563,7 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
         end
         if need <= sp.t then
 
-          if dy <= CFG.Grab.ArmReach then
+          if dy <= JP.armReach() then
             if not lowP then lowP, lowT, lowDy, lowRun = sp.p, sp.t, dy, run end
             break
           elseif not hiP then
@@ -6491,7 +6643,7 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
   faceBall(pick, dt, CFG.Grab.CatchFaceRate)
   local bp = (ballTrueNow(posOf(info.ball), BALL.vel, BALL.stale))
 
-  if pickDy > CFG.Grab.ArmReach and not airborne then
+  if pickDy > JP.armReach() and not airborne then
     local lead = JP.jumpLead(pickDy)
     if pickT <= lead then
       PBX.gs("catch jump", pickDy)
@@ -6541,11 +6693,11 @@ function PBX.coveredByMate(cp, hp)
       if p then
         local rel = (p - cp) * FLAT
         if rel.Magnitude <= rad then
-          if sAttr(c, "HoldingG") == true then return c, "in stance" end
+          if sAttr(c, "HoldingG") == true then return c, "in stance", true end
           local a = sAttr(c, "Action")
-          if a == "Blocking" then return c, "blocking" end
-          if a == "Stealing" then return c, "going for the steal" end
-          if sAttr(c, "InAir") == true then return c, "in the air on him" end
+          if a == "Blocking" then return c, "blocking", true end
+          if a == "Stealing" then return c, "going for the steal", true end
+          if sAttr(c, "InAir") == true then return c, "in the air on him", true end
           -- И ПРОСТО СТОЯТЬ НА ЛИНИИ — ЭТО ТОЖЕ ЗАЩИТА.
           -- Стойку живой игрок держит редко, а закрывать проход телом —
           -- постоянно. Если напарник между носителем и нашим кольцом и не
@@ -6555,7 +6707,10 @@ function PBX.coveredByMate(cp, hp)
             if along > 0 then
               local lat = (rel - u * along).Magnitude
               if lat <= D.CoveredLane then
-                return c, ("on the line, %.1f in front"):format(along)
+                -- Третьим значением — АКТИВНО ли он противодействует. Просто
+                -- стоять на линии это тоже защита, но для накрытия данка
+                -- этого мало: там нужен реально прыгающий напарник.
+                return c, ("on the line, %.1f in front"):format(along), false
               end
             end
           end
@@ -6564,6 +6719,47 @@ function PBX.coveredByMate(cp, hp)
     end
   end
   return nil
+end
+
+-- РЕШЕНИЕ ДОЛЖНО ЛИПНУТЬ, ИНАЧЕ ПОЛУЧАЕТСЯ ДЁРГАНЬЕ.
+-- Напарник шевелится: кадр он в стойке или на линии, следующий уже нет.
+-- В журнале это видно построчно — три кадра "target FUNNYBOYRICH123", два
+-- кадра "leaving him to the mate", снова "target". Мы стартуем, тормозим,
+-- снова стартуем и никуда не приходим, попутно заваливая канал пакетами
+-- Move. Снаружи это читается ровно как «всё равно идёт на прикрытого».
+-- Приняли решение — держим его CoveredHold секунд, пока напарник жив.
+PBX.covHold = weakKeys({})
+function PBX.coveredSticky(who, cp, hp)
+  local mate, why, active = PBX.coveredByMate(cp, hp)
+  local H, now = PBX.covHold, os.clock()
+  if mate then
+    local e = H[who]
+    if not e then e = {}; H[who] = e end
+    e.at, e.mate, e.why, e.active = now, mate, why, active
+    return mate, why, active
+  end
+  local e = H[who]
+  if e and e.mate and e.mate.Parent
+     and (now - (e.at or 0)) < (CFG.Defense.CoveredHold or 0) then
+    return e.mate, tostring(e.why or "covered") .. " (still holding)", e.active
+  end
+  return nil
+end
+
+-- ЕДИНОЕ ПРАВИЛО ДЛЯ ВСЕХ, КТО ВЕДЁТ НАС НА ИГРОКА.
+-- Таких систем ТРИ: Auto Defense, Auto Move и Auto Intercept, плюс Contest
+-- Shooter телепортом. Проверка «его уже держит напарник» стояла только в
+-- первой. Отсюда «меня всё равно ведёт на прикрытого»: вёл не AutoDefend.
+-- activeOnly — считать прикрытым лишь при ЖИВОМ противодействии (стойка,
+-- блок, прыжок). Нужно для данка: там стоящий рядом напарник ничего не
+-- решает, и накрыть вдвоём лучше, чем не накрыть вовсе.
+function PBX.leaveToMate(enemy, cp, activeOnly)
+  if not (CFG.Defense.SkipCovered and enemy and cp) then return nil end
+  local mate, why, active = PBX.coveredSticky(enemy, cp, hoopWeDefend())
+  if not mate then return nil end
+  if activeOnly and not active then return nil end
+  HUB.leftToMate = (HUB.leftToMate or 0) + 1
+  return mate, why
 end
 
 local function guardSpot(target, me)
@@ -6675,7 +6871,7 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
         else
           local d = ((cp-me)*FLAT).Magnitude
           if d <= CFG.Defense.Engage then
-            local mate, doing = PBX.coveredByMate(cp, hoopWeDefend())
+            local mate, doing = PBX.coveredSticky(c, cp, hoopWeDefend())
             if mate then
               covered += 1
               coveredWhy = ("%s already has %s (%s)")
@@ -6940,6 +7136,15 @@ local function contestEngage(c, why, provisional)
   end
   local d = (cp - me).Magnitude
   if d > B.MaxDist then HUB.blatantWhy = "shooter out of reach"; return false end
+  -- Телепорт на уже накрытого — потраченный эпизод, как и пеший заход.
+  do
+    local mate, doing
+    if PBX.leaveToMate then mate, doing = PBX.leaveToMate(c, cp) end
+    if mate then
+      HUB.blatantWhy = ("leaving %s to %s (%s)"):format(c.Name, mate.Name, tostring(doing))
+      return false
+    end
+  end
 
   local pc = proxyPart(); if not pc then return false end
   local okc, realCF = pcall(RDR.CFrame, pc)
@@ -7352,7 +7557,7 @@ local function save()
     antiSide = HUB.antiSide, antiSideMax = CFG.AntiDef.SideMax,
     tickEarly = CFG.TickEarly,
     shotNoStart = HUB.shotNoStart, shotRetry = HUB.shotRetry,
-    spoofWhy = HUB.spoofWhy, spoofWaited = HUB.spoofWaited,
+    spoofWhy = HUB.spoofWhy,
     ballIsPass = BALL.isPass, ballHoldAct = BALL.holdAct,
     blatantSkipCD = HUB.blatantSkipCD, ghostSelfHealed = HUB.ghostSelfHealed,
     blatantBackPending = (BL and BL.backCF ~= nil) or nil,
@@ -7364,7 +7569,9 @@ local function save()
     wantSprint = HUB.wantSprint,
     defOffLine = HUB.defOffLine, defLeadMax = CFG.Defense.LeadMax,
     defSkipCovered = CFG.Defense.SkipCovered, defCoveredRad = CFG.Defense.CoveredRad,
-    defCovered = HUB.defCovered,
+    defCovered = HUB.defCovered, defCoveredHold = CFG.Defense.CoveredHold,
+    leftToMate = HUB.leftToMate, steerN = HUB.steerN,
+    antiActiveN = HUB.antiActiveN,
     defMoveSpeed = CFG.Defense.MoveSpeed,
     antiDribRange = CFG.AntiDef.DribbleRange, antiDribCD = CFG.AntiDef.DribbleCD,
     blatantJumpN = BL and BL.jumpN or nil,
@@ -7400,6 +7607,9 @@ local function save()
       local n = 0; for _ in pairs(PBX.AE.pkgs) do n = n + 1 end; return n end)() or nil,
     jumpLagFallback = CFG.Grab.JumpLagFallback * dataPing(),
 
+    armReach = HUB.armReach, armReachSrc = HUB.armReachSrc,
+    armReachH = HUB.armReachH, armReachW = HUB.armReachW,
+    armReachRoot = HUB.armReachRoot, armReachConst = CFG.Grab.ArmReach,
     jumpApex = HUB.jumpApex, jumpApexN = HUB.jumpApexN,
     jumpApexBad = HUB.jumpApexBad, reachY = JP.reachY(),
     blockWhy = HUB.blockWhy, grabWhy = HUB.grabWhy,
@@ -7610,6 +7820,14 @@ local function save()
   end
   rep(("[PB] ball nature: last holder action %s | treated as a pass: %s")
     :format(tostring(BALL.holdAct or "-"), tostring(BALL.isPass)))
+  do
+    local t = {}
+    for k, n in pairs(HUB.steerN or {}) do t[#t+1] = ("%s x%d"):format(k, n) end
+    table.sort(t)
+    rep(("[PB] who steered you: %s | right now: %s | left to a mate %d times")
+      :format(#t > 0 and table.concat(t, " | ") or "nobody",
+              tostring(HUB.moveOwner or "you"), HUB.leftToMate or 0))
+  end
   rep(("[PB] anti defense: push=%s | dribble=%s (%s) | %s")
     :format(tostring(CFG.AntiDef.PushOn), tostring(CFG.AntiDef.Dribble),
             tostring(HUB.antiDribLast or "-"), tostring(HUB.antiDrib or "-")))
@@ -7749,11 +7967,13 @@ local function save()
   rep(("[PB] anti contest: %s | dodge before shot: %s (max %.0f stds)")
     :format(tostring(meta.antiShot or "no shot yet"),
             tostring(meta.antiPreShot), CFG.AntiDef.MaxShift))
+  rep(("[PB] arms: %.2f stds from the root | %s")
+    :format(JP.armReach(), tostring(HUB.armReachSrc or "not computed yet")))
   rep(("[PB] vertical: reach %.1f stds = apex %s + arms %.1f | in match: %s (gate %s)")
     :format(meta.reachY or -1,
             meta.jumpApex and ("%.1f measured x%d"):format(meta.jumpApex, meta.jumpApexN or 0)
               or "not measured yet (estimate)",
-            CFG.Grab.ArmReach, tostring(meta.inMatch), tostring(meta.onlyInMatch)))
+            JP.armReach(), tostring(meta.inMatch), tostring(meta.onlyInMatch)))
   rep(("[PB] stance: Auto Defense holdG=%s | Auto Move stance=%s (enabled %s, steal %s)")
     :format(tostring(meta.holdG), tostring(meta.autoStance),
             tostring(meta.m2Stance), tostring(meta.m2Steal)))
@@ -7781,7 +8001,7 @@ local function save()
       rep(("[PB]   ball arrived %+.0f ms vs predicted on average (plus = we jumped early)")
         :format(s / math.max(n, 1)))
       rep(("[PB]   reach model says %.1f stds = apex %.2f + arms %.1f")
-        :format(JP.reachY(), HUB.jumpApex or -1, CFG.Grab.ArmReach))
+        :format(JP.reachY(), HUB.jumpApex or -1, JP.armReach()))
       for _, e in ipairs(jl) do
         rep(("[PB]   %s dy %s (needed %s up) | arrErr %+d ms | lead %d ms | traj err %s | ping %d ms")
           :format(e.reached and "REACHED" or "missed ", tostring(e.dy),
@@ -8974,7 +9194,7 @@ return function(_Lib, _Core)
         Min = 0.05, Max = 1, Precision = 2,
         Callback = function(v) CFG.Face.Smooth = v end })
       bool(s1, "Leave Covered Men",
-        "skip an attacker your teammate is already guarding, go find the free one",
+        "any feature that walks you at a man obeys this, not just this one",
         function() return CFG.Defense.SkipCovered end,
         function(v) CFG.Defense.SkipCovered = v end, "DEF_SkipCovered")
       slider(s1, { Name = "Counts As Covered", Flag = "DEF_CoveredRad",
