@@ -1,4 +1,4 @@
---[[ PRACTICAL BASKETBALL v146 — Potassium/UNC — модуль для лоадера Syllinse ]]
+--[[ PRACTICAL BASKETBALL v147 — Potassium/UNC — модуль для лоадера Syllinse ]]
 
 -- Luraph macro prelude. Installed through STRING KEYS on the global env so a
 -- bare macro token never appears in real code (that would abort Luraph). Raw,
@@ -20,7 +20,7 @@ do
   end
 end
 
-local VERSION = 146
+local VERSION = 147
 
 local CFG = {
 
@@ -138,6 +138,9 @@ local CFG = {
     MapCheck   = true,
     Bounces    = 3,
     BounceKeep = 0.55,
+    -- Насколько выше пола лежит ЦЕНТР мяча. Дуга рисуется по центру, поэтому
+    -- без этой поправки линия наполовину тонет в площадке.
+    FloorPad   = 0.6,
 
     RayNear    = 14,
     RayBudget  = 24,
@@ -493,32 +496,6 @@ local CFG = {
     -- остаётся false, и разброс за бег на месте не начисляется вовсе.
     -- Скорость при этом не теряется — прибавку мы пишем в скорость сами.
     HideSprint = false,
-  },
-
-  Vis = {
-    Zones    = false,  -- круги зон работы на площадке
-    Path     = false,  -- дорожка: куда скрипт ведёт и что делает
-    Segments = 40,
-    Thick    = 2,
-    Labels   = true,
-    -- Подъём над полом. Сам пол ищем лучом вниз, а не по lastValidHeight:
-    -- на разноуровневых площадках парка тот отстаёт, и рисунок уезжал вверх.
-    Lift     = 0.10,
-    -- Каждый визуал отключается отдельно.
-    Show = { Spoof = true, S3 = true, Slip = true, RimFree = true,
-             Defend = true, Catch = true },
-    Col = {
-      Spoof   = Color3.fromRGB(255, 170,  40),
-      S3      = Color3.fromRGB( 80, 220, 255),
-      Slip    = Color3.fromRGB(255,  90, 160),
-      RimFree = Color3.fromRGB(120, 255, 120),
-      Defend  = Color3.fromRGB(255, 210,  70),
-      Catch   = Color3.fromRGB( 90, 255, 140),
-      Path    = Color3.fromRGB( 90, 190, 255),
-    },
-    PathByOwner = true,   -- цвет дорожки по тому, кто рулит
-    PathWidth   = 1.2,    -- ширина дорожки в студах
-    PathFlow    = true,   -- бегущие поперечины
   },
 
   AntiDef = {
@@ -2751,6 +2728,44 @@ function PBX.hoopRay(cp, seg)
   return ok and hit or nil
 end
 
+-- ВЫСОТА ПОЛА ПОД ТОЧКОЙ, ОДНИМ ЛУЧОМ И С КЭШЕМ.
+-- Раньше пол для дуги брался из charComp.lastValidHeight. Это не пол, а
+-- высота, на которую игра САМА ставит персонажа: она обновляется по игроку,
+-- а не по мячу, и на разноуровневой площадке отстаёт. Если же charComp не
+-- нашёлся, floorY выходил nil, и проверка низа не срабатывала ВООБЩЕ.
+-- Луч вниз даёт настоящую высоту под конкретной точкой. Зовём один раз на
+-- марш (не на шаг), результат держим, пока точка не уехала дальше восьми
+-- студов, чтобы не стрелять каждый кадр.
+PBX.gnd = { y = nil, at = 0, p = nil }
+function PBX.groundUnder(pos)
+  local G = PBX.gnd
+  local now = os.clock()
+  if G.y and G.p and (now - G.at) < 0.30
+     and ((pos - G.p) * FLAT).Magnitude < 8 then return G.y end
+  G.at, G.p = now, pos
+  PBX.gndRP = PBX.gndRP or RaycastParams.new()
+  local pc = proxyPart()
+  if PBX.gndProxy ~= pc then
+    PBX.gndRP.FilterType = Enum.RaycastFilterType.Exclude
+    local list = {}
+    local ch = sChild(Workspace, "Characters");  if ch then list[#list+1] = ch end
+    local bb = sChild(Workspace, "Basketballs"); if bb then list[#list+1] = bb end
+    if pc then list[#list+1] = pc end
+    PBX.gndRP.FilterDescendantsInstances = list
+    PBX.gndProxy = pc
+  end
+  local ok, hit = pcall(function()
+    return Workspace:Raycast(pos + Vector3.new(0, 3, 0), Vector3.new(0, -140, 0), PBX.gndRP)
+  end)
+  if ok and hit then
+    G.y = hit.Position.Y
+  else
+    local lv = charComp and rawget(charComp, "lastValidHeight")
+    if type(lv) == "number" then G.y = lv end
+  end
+  return G.y
+end
+
 -- Per-step predicate inside the native PBX.march loop (called up to
 -- Samples/PhysSamples times per arc per frame). Kept native so each march step
 -- does not bounce back into the VM.
@@ -2772,8 +2787,13 @@ end)
 PBX.march = LPH_NO_VIRTUALIZE(function(p0, v0, dur, n, ball)
   local g = Vector3.new(0, -Workspace.Gravity, 0)
   local arc, step = {}, dur / n
-  local floorY = (charComp and rawget(charComp, "lastValidHeight")) or nil
+  local floorY = PBX.groundUnder(p0)
   if type(floorY) ~= "number" then floorY = nil end
+  -- Мяч это шар, и его ЦЕНТР останавливается не на полу, а на радиусе выше.
+  if floorY then floorY = floorY + CFG.Traj.FloorPad end
+  -- Если мяч почему-то уже ниже найденного пола (например пол определился по
+  -- трибуне над нами), низ не трогаем вовсе: иначе оборвём дугу на первом шаге.
+  local useFloor = floorY ~= nil and p0.Y > floorY + 0.2
   local cp, cv, t = p0, v0, 0
   arc.p0, arc.v0 = p0, v0
   arc[1] = { t = 0, p = cp }
@@ -2807,6 +2827,31 @@ PBX.march = LPH_NO_VIRTUALIZE(function(p0, v0, dur, n, ball)
           continue
         end
       end
+    end
+    -- ПОЛ СЧИТАЕМ АНАЛИТИЧЕСКИ, БЕЗ ЛУЧЕЙ, И ВНЕ ИХ БЮДЖЕТА.
+    -- Отскок от площадки раньше зависел от двух лимитов: RayBudget = 24 лучей
+    -- и Bounces = 3 отскока. На броске в кольцо оба кончаются на дужке и щите,
+    -- после чего блок с лучами выключается целиком — и дуга дальше просто
+    -- интегрируется сквозь площадку. Ровно это и видно как «уходит под землю».
+    -- Пол это горизонтальная плоскость, луч для неё не нужен: пересечение
+    -- считается прямо. И когда отскоки кончились, дуга ЗАКАНЧИВАЕТСЯ на полу,
+    -- а не продолжается вниз.
+    if useFloor and np.Y < floorY and cv.Y < 0 then
+      local drop = cp.Y - np.Y
+      local frac = (drop > 1e-6) and math.clamp((cp.Y - floorY) / drop, 0, 1) or 0
+      local dt = step * frac
+      t += dt
+      local hp2 = cp + (np - cp) * frac
+      arc[#arc+1] = { t = t, p = Vector3.new(hp2.X, floorY, hp2.Z),
+                      hit = true, floor = true, bounce = bounces + 1 }
+      if bounces >= CFG.Traj.Bounces then break end
+      bounces += 1
+      local vAt = cv + g*dt
+      cv = Vector3.new(vAt.X, -vAt.Y, vAt.Z) * CFG.Traj.BounceKeep
+      cp = Vector3.new(hp2.X, floorY + 0.05, hp2.Z)
+      -- Отскок выродился в скольжение по полу: дальше рисовать нечего.
+      if cv.Y < 1.5 then break end
+      continue
     end
     cv = cv + g*step
     cp = np
@@ -3085,308 +3130,15 @@ PBX.drawTraj = LPH_NO_VIRTUALIZE(function()
   end
 end)
 
--- ВИЗУАЛЫ ЗОН И МАРШРУТА.
--- Свой пул объектов Drawing, отдельный от траектории: тот индексируется
--- точками дуги и перебирается целиком на каждый кадр. Объекты создаются один
--- раз и переиспользуются, лишние прячутся, а каждая вершина проецируется на
--- экран по одному разу, а не по два.
-local VZ = { lines = {}, texts = {}, nL = 0, nT = 0, cam = nil,
-             floorY = nil, floorAt = 0 }
-
-function VZ.line()
-  VZ.nL += 1
-  -- Потолок на всякий случай: рисуем кругами, и если выкрутить Smoothness
-  -- вместе со всеми зонами, пул не должен расти без предела.
-  if VZ.nL > 460 then return nil end
-  local l = VZ.lines[VZ.nL]
-  if l == nil then
-    local ok, d = pcall(function()
-      local x = Drawing.new("Line")
-      x.Thickness = CFG.Vis.Thick; x.Transparency = 1
-      x.ZIndex = CFG.Traj.ZIndex; x.Visible = false
-      return x
-    end)
-    l = ok and d or false
-    VZ.lines[VZ.nL] = l
-  end
-  return l or nil
-end
-
-function VZ.textObj()
-  VZ.nT += 1
-  if VZ.nT > 24 then return nil end
-  local t = VZ.texts[VZ.nT]
-  if t == nil then
-    local ok, d = pcall(function()
-      local x = Drawing.new("Text")
-      x.Size = 14; x.Center = true; x.Outline = true
-      x.Transparency = 1; x.ZIndex = CFG.Traj.ZIndex + 2
-      x.Visible = false
-      return x
-    end)
-    t = ok and d or false
-    VZ.texts[VZ.nT] = t
-  end
-  return t or nil
-end
-
-function VZ.hideFrom(nl, nt)
-  for i = nl + 1, #VZ.lines do
-    local l = VZ.lines[i]; if l then pcall(PBX.setVis, l, false) end
-  end
-  for i = nt + 1, #VZ.texts do
-    local t = VZ.texts[i]; if t then pcall(PBX.setVis, t, false) end
-  end
-end
-function VZ.hideAll() VZ.hideFrom(0, 0); VZ.nL, VZ.nT = 0, 0 end
-
--- ПОЛ ИЩЕМ ЛУЧОМ ВНИЗ, А НЕ ПО lastValidHeight.
--- Тот атрибут — высота, на которую игра САМА ставит персонажа, и на
--- разноуровневой площадке он отстаёт от реального пола под ногами: рисунок
--- уезжал вверх, что и было видно. Луч даёт точную высоту прямо под нами.
-function VZ.floor()
-  local now = os.clock()
-  if VZ.floorY and (now - VZ.floorAt) < 0.20 then return VZ.floorY end
-  local me = selfPos()
-  if not me then return VZ.floorY end
-  VZ.floorAt = now
-  VZ.rp = VZ.rp or RaycastParams.new()
-  local pc = proxyPart()
-  if VZ.rpProxy ~= pc then
-    VZ.rp.FilterType = Enum.RaycastFilterType.Exclude
-    local list = {}
-    local ch = sChild(Workspace, "Characters");  if ch then list[#list+1] = ch end
-    local bb = sChild(Workspace, "Basketballs"); if bb then list[#list+1] = bb end
-    if pc then list[#list+1] = pc end
-    VZ.rp.FilterDescendantsInstances = list
-    VZ.rpProxy = pc
-  end
-  local ok, hit = pcall(function()
-    return Workspace:Raycast(me + Vector3.new(0, 2, 0), Vector3.new(0, -26, 0), VZ.rp)
-  end)
-  if ok and hit then VZ.floorY = hit.Position.Y
-  else VZ.floorY = groundLevel() or (me.Y - 3) end
-  return VZ.floorY
-end
-
-function VZ.seg(a, b, col, thick)
-  local cam = VZ.cam; if not cam then return end
-  local l = VZ.line(); if not l then return end
-  local s1, on1 = cam:WorldToViewportPoint(a)
-  local s2, on2 = cam:WorldToViewportPoint(b)
-  if on1 and on2 then
-    l.From = Vector2.new(s1.X, s1.Y)
-    l.To   = Vector2.new(s2.X, s2.Y)
-    l.Color = col
-    l.Thickness = thick or CFG.Vis.Thick
-    l.Visible = true
-  else
-    l.Visible = false
-  end
-end
-
--- Круг на плоскости пола. Точки проецируем по одной на вершину, а не по две
--- на отрезок: при сорока сегментах это 41 вызов вместо 80.
-function VZ.ring(c, rad, col, y, n)
-  local cam = VZ.cam; if not (cam and rad and rad > 0.3) then return end
-  n = math.clamp(math.floor(n or CFG.Vis.Segments), 6, 64)
-  local step = math.pi * 2 / n
-  local py = y or c.Y
-  local sPrev, onPrev = cam:WorldToViewportPoint(Vector3.new(c.X + rad, py, c.Z))
-  for i = 1, n do
-    local a = step * i
-    local s, on = cam:WorldToViewportPoint(
-      Vector3.new(c.X + math.cos(a) * rad, py, c.Z + math.sin(a) * rad))
-    local l = VZ.line()
-    if l then
-      if onPrev and on then
-        l.From = Vector2.new(sPrev.X, sPrev.Y)
-        l.To   = Vector2.new(s.X, s.Y)
-        l.Color = col; l.Thickness = CFG.Vis.Thick; l.Visible = true
-      else l.Visible = false end
-    end
-    sPrev, onPrev = s, on
-  end
-end
-
-function VZ.label(pos, str, col)
-  if not CFG.Vis.Labels then return end
-  local cam = VZ.cam; if not cam then return end
-  local t = VZ.textObj(); if not t then return end
-  local s, on = cam:WorldToViewportPoint(pos)
-  if on then
-    t.Position = Vector2.new(s.X, s.Y)
-    t.Text = str; t.Color = col; t.Visible = true
-  else t.Visible = false end
-end
-
--- ДОРОЖКА ВМЕСТО РОССЫПИ СТРЕЛОК.
--- Прошлый вариант рисовал линию и «галочки» назад-в-стороны от неё, и вместе
--- с крестом на цели это читалось как мусор. Здесь честная дорожка: две
--- направляющие по краям, поперечины между ними и кольцо с мачтой на цели.
--- Поперечины сдвигаются по времени, поэтому направление видно сразу и без
--- наконечников — так же читается путь в Baritone.
-function VZ.path(from, to, col, y)
-  local d = (to - from) * FLAT
-  local len = d.Magnitude
-  if len < 0.8 then return end
-  local u = d.Unit
-  local right = Vector3.new(-u.Z, 0, u.X) * (CFG.Vis.PathWidth * 0.5)
-  local a = Vector3.new(from.X, y, from.Z)
-  local b = Vector3.new(to.X, y, to.Z)
-  VZ.seg(a + right, b + right, col)
-  VZ.seg(a - right, b - right, col)
-  local step = 2.0
-  local at = CFG.Vis.PathFlow and ((os.clock() * 5) % step) or step * 0.5
-  local guard = 0
-  while at < len and guard < 36 do
-    guard += 1
-    local p = a + u * at
-    VZ.seg(p - right, p + right, col)
-    at += step
-  end
-  VZ.ring(b, CFG.Vis.PathWidth, col, y, 14)
-  VZ.seg(b, b + Vector3.new(0, 2.6, 0), col)
-end
-
-function VZ.ownerColor(o)
-  local C = CFG.Vis.Col
-  if not CFG.Vis.PathByOwner then return C.Path end
-  if o == "grab" then return C.Catch
-  elseif o == "defense" then return C.Defend
-  elseif o == "anti" then return C.Slip
-  elseif o == "s3" then return C.S3 end
-  return C.Path
-end
-
--- Что скрипт СЕЙЧАС делает — берём объяснение того владельца, который рулит.
-function VZ.ownerWhy(o)
-  if o == "grab" then return HUB.grabWhy or HUB.blockWhy
-  elseif o == "automove" then return HUB.autoWhy
-  elseif o == "defense" then return HUB.defWhy or "guarding"
-  elseif o == "anti" then return HUB.antiShot
-  elseif o == "s3" then return HUB.s3Why end
-  return nil
-end
-
-function VZ.draw()
-  local V = CFG.Vis
-  if not (HUB.running and Drawing and (V.Zones or V.Path)) then
-    if VZ.nL > 0 or VZ.nT > 0 then pcall(VZ.hideAll) end
-    return
-  end
-  local cam = Workspace.CurrentCamera
-  if not cam then pcall(VZ.hideAll); return end
-  VZ.cam, VZ.nL, VZ.nT = cam, 0, 0
-
-  local me = selfPos()
-  local gy = (VZ.floor() or 0) + V.Lift
-  local S, C = V.Show, V.Col
-  -- Второстепенные оттенки не отдельные настройки, а притушенный основной
-  -- цвет: меняешь один — вся пара остаётся согласованной.
-  local function dim(c) return Color3.new(c.R * 0.55, c.G * 0.55, c.B * 0.55) end
-
-  if V.Zones then
-    local hp = me and nearestHoop(me) or nil
-    if hp then
-      if S.Spoof and CFG.Spoof.Enabled then
-        -- Дальше этой черты подмена дистанции включается, ближе — молчит.
-        VZ.ring(hp, CFG.Spoof.MinRealDist, C.Spoof, gy)
-        VZ.label(Vector3.new(hp.X, gy + 1.6, hp.Z - CFG.Spoof.MinRealDist),
-          ("spoof from %.0f"):format(CFG.Spoof.MinRealDist), C.Spoof)
-        -- И куда она нас ставит на регистрации.
-        VZ.ring(hp, CFG.Spoof.FakeDist, dim(C.Spoof), gy)
-        VZ.label(Vector3.new(hp.X, gy + 1.6, hp.Z - CFG.Spoof.FakeDist),
-          ("shown at %.0f"):format(CFG.Spoof.FakeDist), dim(C.Spoof))
-      end
-      if S.S3 and CFG.S3.Enabled then
-        local need = CFG.S3.LineDist + 0.95 + CFG.S3.Extra
-        VZ.ring(hp, need, C.S3, gy)
-        VZ.label(Vector3.new(hp.X + need, gy + 1.6, hp.Z),
-          ("3pt target %.1f"):format(need), C.S3)
-        local from = need - CFG.S3.Window
-        if from > 1 then
-          VZ.ring(hp, from, dim(C.S3), gy)
-          VZ.label(Vector3.new(hp.X + from, gy + 1.6, hp.Z),
-            ("reach from %.1f"):format(from), dim(C.S3))
-        end
-      end
-      if S.RimFree and CFG.Move.Slip.Enabled and CFG.Move.RimFree > 0 then
-        -- Внутри этого круга курс не гнём вообще, чтобы разгон в данк уцелел.
-        VZ.ring(hp, CFG.Move.RimFree, C.RimFree, gy)
-      end
-    end
-    if S.Slip and CFG.Move.Slip.Enabled and me then
-      -- Зона работы обхода. В режиме Feint это радиус, с которого он вообще
-      -- начинает читать соперников; в Default — радиус контакта, помноженный
-      -- на Start Distance, то есть расстояние, с которого начинается увод.
-      local SL = CFG.Move.Slip
-      local r = (SL.Mode == "Feint") and SL.ReactRadius or (2.0 * 1.2 * SL.StartMul)
-      VZ.ring(me, r, C.Slip, gy)
-      VZ.label(Vector3.new(me.X, gy + 1.6, me.Z - r),
-        ("slip %s %.1f"):format(tostring(SL.Mode), r), C.Slip)
-    end
-    -- ЗАЩИТА: линия «подопечный — наше кольцо» и точка, куда мы встаём.
-    -- По ней сразу видно, действительно ли мы закрываем кольцо, или стоим
-    -- сбоку — то, ради чего вся правка геометрии и делалась.
-    if S.Defend and CFG.Defense.Enabled and HUB.defTargetPos and HUB.defSpot then
-      local tp, sp = HUB.defTargetPos, HUB.defSpot
-      local dh = hoopWeDefend()
-      if dh then
-        VZ.seg(Vector3.new(tp.X, gy, tp.Z), Vector3.new(dh.X, gy, dh.Z), C.Defend)
-      end
-      VZ.ring(Vector3.new(sp.X, gy, sp.Z), 1.1, C.Defend, gy, 14)
-      VZ.seg(Vector3.new(sp.X, gy, sp.Z), Vector3.new(sp.X, gy + 2.4, sp.Z), C.Defend)
-      VZ.ring(Vector3.new(tp.X, gy, tp.Z), 0.8, C.Defend, gy, 10)
-      if HUB.defOffLine then
-        VZ.label(Vector3.new(sp.X, gy + 3.0, sp.Z),
-          ("guard %.1f off line"):format(HUB.defOffLine), C.Defend)
-      end
-    end
-    -- ПЕРЕХВАТ: точка, в которой скрипт рассчитывает взять мяч.
-    if S.Catch and CFG.Grab.Enabled and HUB.grabPoint
-       and (os.clock() - (HUB.grabPointAt or 0)) < 0.4 then
-      local p = HUB.grabPoint
-      VZ.ring(Vector3.new(p.X, gy, p.Z), 1.4, C.Catch, gy, 16)
-      VZ.seg(Vector3.new(p.X, gy, p.Z), p, C.Catch)
-      VZ.ring(p, 0.9, C.Catch, p.Y, 12)
-    end
-  end
-
-  if V.Path and me then
-    local fresh = HUB.navAt and (os.clock() - HUB.navAt) < 0.35
-    local owner = fresh and HUB.navOwner or nil
-    if owner then
-      local col = VZ.ownerColor(owner)
-      local goal = HUB.navGoal
-      if not goal and typeof(HUB.navDir) == "Vector3" and HUB.navDir.Magnitude > 0.1 then
-        goal = me + HUB.navDir.Unit * 10
-      end
-      if goal then
-        VZ.path(me, goal, col, gy)
-        local why = VZ.ownerWhy(owner)
-        VZ.label(Vector3.new(goal.X, gy + 3.4, goal.Z),
-          why and (owner .. ": " .. tostring(why)) or owner, col)
-      end
-    end
-  end
-
-  VZ.hideFrom(VZ.nL, VZ.nT)
-end
-
--- РИСУЕМ ПОСЛЕ ТОГО, КАК КАМЕРА УЖЕ ОБНОВЛЕНА ЗА ЭТОТ КАДР.
--- В RenderStepped камера ещё СТАРАЯ: движок обновляет её позже, и линии,
--- привязанные к миру, отстают ровно на кадр. При шифтлоке камера крутится
--- непрерывно, поэтому отставание видно как постоянный сдвиг рисунка вбок.
--- BindToRenderStep с приоритетом сразу ПОСЛЕ Camera выполняется уже с
--- обновлённой камерой — сдвига нет. Если метод недоступен, откатываемся на
--- Heartbeat: он тоже идёт после камеры, просто на кадр позже отрисовки.
+-- Отрисовка идёт ОДНИМ шагом, и он выполняется уже ПОСЛЕ обновления камеры.
+-- В RenderStepped камера за этот кадр ещё старая: линии, привязанные к миру,
+-- отстают ровно на кадр, и при шифтлоке это видно как постоянный сдвиг вбок.
+-- Heartbeat не помог бы — он идёт после отрисовки, камера там тоже прошлая.
+-- BindToRenderStep с приоритетом сразу после Camera берёт свежую. Если метод
+-- недоступен, откатываемся на Heartbeat.
 do
-  -- Один шаг отрисовки на всё: дуга мяча и зоны с дорожкой. Так они гаранти-
-  -- рованно берут ОДНУ И ТУ ЖЕ камеру и не расходятся между собой.
   local function drawFrame()
     if PBX.drawTraj then pcall(PBX.drawTraj) end
-    VZ.draw()
   end
   local bound = false
   local okb = pcall(function()
@@ -3397,11 +3149,10 @@ do
   if okb and bound then
     track({ Disconnect = function()
       pcall(function() RunService:UnbindFromRenderStep("PBVisuals") end)
-      pcall(VZ.hideAll)
+      pcall(hideAll)
     end })
   else
     track(RunService.Heartbeat:Connect(drawFrame))
-    track({ Disconnect = function() pcall(VZ.hideAll) end })
   end
 end
 
@@ -4392,12 +4143,6 @@ local function steerToDir(dir, sprint, owner, silent)
     HUB.moveNeedInput = (owner == "defense") and (CFG.Defense.Mode == "Hook")
     HUB.moveSrc = tostring(HUB.pmSrc)
     HUB.cmdDir, HUB.cmdAt = dir, os.clock()
-    -- СЛЕД ДЛЯ ВИЗУАЛА МАРШРУТА.
-    -- Здесь известно только НАПРАВЛЕНИЕ; конкретную точку, если она есть,
-    -- дописывает steerTo сразу после вызова. Владелец и время нужны, чтобы
-    -- стрелки гасли сами, когда рулить перестали.
-    HUB.navGoal, HUB.navDir = nil, dir
-    HUB.navOwner, HUB.navAt = owner or "?", os.clock()
   else
     HUB.moveSrc = "remote only: " .. tostring(HUB.pmSrc)
   end
@@ -4423,7 +4168,6 @@ function stopSteerSoft(owner)
   if owner and HUB.moveOwner and HUB.moveOwner ~= owner then return end
   HUB.moveWorld, HUB.moveAt, HUB.moveOwner = nil, nil, nil
   HUB.moveNeedInput = nil
-  HUB.navGoal, HUB.navDir, HUB.navOwner = nil, nil, nil
 end
 
 track(RunService.Heartbeat:Connect(function()
@@ -4496,14 +4240,12 @@ local function steerTo(pt, owner)
   local d = (pt - me) * FLAT
   if d.Magnitude < 1 then stopSteerSoft(owner); return end
   steerToDir(d.Unit, CFG.Grab.Sprint and true or false, owner)
-  HUB.navGoal = pt
 end
 
 local function stopSteer(owner)
   if owner and HUB.moveOwner and HUB.moveOwner ~= owner then return end
   HUB.moveWorld, HUB.moveAt, HUB.moveOwner = nil, nil, nil
   HUB.moveNeedInput = nil
-  HUB.navGoal, HUB.navDir, HUB.navOwner = nil, nil, nil
   HUB.defDir = nil
   if not HUB.steering then return end
   HUB.steering = nil
@@ -5789,7 +5531,6 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
                 local lead = dyAt and JP.jumpLead(dyAt) or nil
                 if tIn and dyAt and lead and dyAt >= -2 and dyAt <= JP.reachY()
                    and tIn > 0.03 and tIn <= lead then
-                  HUB.grabPoint, HUB.grabPointAt = qAt, os.clock()
                   local why = ("rim catch: jumping %.0f ms early, ball in %.0f ms, dy %+.1f")
                     :format(lead*1000, tIn*1000, dyAt)
                   HUB.blockWhy = why
@@ -6151,7 +5892,6 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
 
   PBX.why("grabWhy", "catch in %.0f ms, %.1f stds away, dy %+.1f",
           pickT * 1000, pickRun, pickDy)
-  HUB.grabPoint, HUB.grabPointAt = pick, os.clock()
 
   -- ЦЕЛЬ ХОДЬБЫ СМЕЩАЕМ ВПЕРЁД ПО ДУГЕ, А ЦЕЛЬ ВЗГЛЯДА ОСТАВЛЯЕМ НА МЯЧЕ.
   -- Смотрим туда, где мяч будет в момент хвата, но ногами идём чуть дальше:
@@ -6296,7 +6036,6 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
     stopSteer("defense")
     HUB.defActive = false
     HUB.defSpeed, HUB.defSpeedUntil = nil, nil
-    HUB.defTargetPos, HUB.defSpot = nil, nil
   end
   if not CFG.Defense.Enabled then defOff(); return end
 
@@ -6363,8 +6102,6 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
     local lim = CFG.Defense.StandBase + CFG.Defense.BlowbyAhead
     if off.Magnitude > lim then spot = tp + off.Unit * lim end
   end
-  -- Для визуала защиты: где подопечный и куда мы встаём.
-  HUB.defTargetPos, HUB.defSpot = tp, spot
 
   local flat = (spot - me) * FLAT
   local gap  = flat.Magnitude
@@ -6916,11 +6653,8 @@ local function save()
     hideSprint = CFG.Zero.HideSprint, sprintHidden = HUB.sprintHidden,
     wantSprint = HUB.wantSprint,
     defOffLine = HUB.defOffLine, defLeadMax = CFG.Defense.LeadMax,
-    visZones = CFG.Vis.Zones, visPath = CFG.Vis.Path, visLift = CFG.Vis.Lift,
-    visFloor = VZ and VZ.floorY or nil,
     defMoveSpeed = CFG.Defense.MoveSpeed,
     antiDribRange = CFG.AntiDef.DribbleRange, antiDribCD = CFG.AntiDef.DribbleCD,
-    navOwner = HUB.navOwner,
     blatantJumpN = BL and BL.jumpN or nil,
     blatantRimGuess = CFG.Blatant.RimGuess,
     blatantStance = CFG.Blatant.StanceTime, blatantJumpWin = CFG.Blatant.JumpWindow,
@@ -8083,9 +7817,6 @@ function HUB.unload()
   hideAll()
   for _,l in pairs(lines) do if l then pcall(function() l:Remove() end) end end
   for _,m in pairs(marks) do if m then pcall(function() m:Remove() end) end end
-  pcall(VZ.hideAll)
-  for _,l in pairs(VZ.lines) do if l then pcall(function() l:Remove() end) end end
-  for _,t in pairs(VZ.texts) do if t then pcall(function() t:Remove() end) end end
   for _,c in ipairs(HUB.conns) do pcall(function() c:Disconnect() end) end
   pcall(restoreMoveKeys)
   if oldNamecall then pcall(function() hookmetamethod(game,"__namecall",oldNamecall) end) end
@@ -9107,68 +8838,6 @@ return function(_Lib, _Core)
       slider(s2, { Name = "Flight Hold", Flag = "MS_FlightHold", Default = CFG.Traj.FlightHold,
         Min = 0.05, Max = 0.6, Precision = 2, Suffix = " s",
         Callback = function(v) CFG.Traj.FlightHold = v end })
-
-      local s3 = T:Section({ Side = "Left" })
-      feature(s3, {
-        Title = "Zone Overlay", Flag = "VZ_Zones",
-        get = function() return CFG.Vis.Zones end,
-        set = function(v) CFG.Vis.Zones = v end,
-        Desc = "draws on the floor the range each feature actually works in"
-      })
-      s3:SubLabel({ Text = "a ring appears only while its own feature is switched on" })
-      slider(s3, { Name = "Height Above Floor", Flag = "VZ_Lift", Default = CFG.Vis.Lift,
-        Min = 0, Max = 3, Precision = 2,
-        Callback = function(v) CFG.Vis.Lift = v end,
-        Desc = "the floor itself is found by a ray under your feet, this only nudges it" })
-      slider(s3, { Name = "Smoothness", Flag = "VZ_Seg", Default = CFG.Vis.Segments,
-        Min = 8, Max = 64,
-        Callback = function(v) CFG.Vis.Segments = v end,
-        Desc = "segments per circle, lower is cheaper on frames" })
-      slider(s3, { Name = "Line Width", Flag = "VZ_ZoneThick", Default = CFG.Vis.Thick,
-        Min = 1, Max = 6,
-        Callback = function(v) CFG.Vis.Thick = v end })
-      bool(s3, "Labels", "name every ring and print the current action",
-        function() return CFG.Vis.Labels end,
-        function(v) CFG.Vis.Labels = v end, "VZ_Labels")
-
-      s3:Divider()
-      s3:Header({ Name = "Which Zones" })
-      local function zone(title, key, desc)
-        bool(s3, title, desc,
-          function() return CFG.Vis.Show[key] end,
-          function(v) CFG.Vis.Show[key] = v end, "VZ_S_" .. key)
-        s3:Colorpicker({ Name = title .. " Color", Default = CFG.Vis.Col[key],
-          Callback = function(c) CFG.Vis.Col[key] = c end }, ctx.flag("VZ_C_" .. key))
-      end
-      zone("Distance Spoof", "Spoof", "where the swap turns on, and where it stands you")
-      zone("Smart 3PT", "S3", "the line it aims past, and how far short it still reaches")
-      zone("Contact Slip", "Slip", "how close a defender gets before it steers you")
-      zone("Rim Free Zone", "RimFree", "inside this your course is never bent")
-      zone("Auto Defense", "Defend", "the line from him to your hoop, and the spot you take")
-      zone("Intercept Point", "Catch", "where the script expects to meet the ball")
-
-      local s4 = T:Section({ Side = "Right" })
-      feature(s4, {
-        Title = "Script Path", Flag = "VZ_Path",
-        get = function() return CFG.Vis.Path end,
-        set = function(v) CFG.Vis.Path = v end,
-        Desc = "a walkway to the spot the script is taking you to, and why"
-      })
-      s4:SubLabel({ Text = "two rails with sliding rungs, a ring and a mast on the target" })
-      bool(s4, "Color By Owner",
-        "intercept, defense and anti defense each keep their own color",
-        function() return CFG.Vis.PathByOwner end,
-        function(v) CFG.Vis.PathByOwner = v end, "VZ_PathOwner")
-      s4:Colorpicker({ Name = "Path Color", Default = CFG.Vis.Col.Path,
-        Callback = function(c) CFG.Vis.Col.Path = c end }, ctx.flag("VZ_C_Path"))
-      s4:SubLabel({ Text = "used when Color By Owner is off" })
-      slider(s4, { Name = "Width", Flag = "VZ_PathW", Default = CFG.Vis.PathWidth,
-        Min = 0.4, Max = 4, Precision = 1,
-        Callback = function(v) CFG.Vis.PathWidth = v end })
-      bool(s4, "Sliding Rungs", "the crossbars run forward, so direction reads at a glance",
-        function() return CFG.Vis.PathFlow end,
-        function(v) CFG.Vis.PathFlow = v end, "VZ_PathFlow")
-      s4:SubLabel({ Text = "it fades out on its own once nothing is steering you" })
     end
 
     do
