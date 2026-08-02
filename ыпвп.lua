@@ -1,4 +1,4 @@
---[[ PRACTICAL BASKETBALL v145 — Potassium/UNC — модуль для лоадера Syllinse ]]
+--[[ PRACTICAL BASKETBALL v146 — Potassium/UNC — модуль для лоадера Syllinse ]]
 
 -- Luraph macro prelude. Installed through STRING KEYS on the global env so a
 -- bare macro token never appears in real code (that would abort Luraph). Raw,
@@ -20,7 +20,7 @@ do
   end
 end
 
-local VERSION = 145
+local VERSION = 146
 
 local CFG = {
 
@@ -343,6 +343,9 @@ local CFG = {
 
     SnapDist = 3.0,
     Deadzone = 0.6,
+    -- Скорость передвижения на защите, пишется в скорость напрямую.
+    -- 0 = не вмешиваться и идти как игра позволяет (потолок 14 + спринт 3.35).
+    MoveSpeed = 0,
 
     StandShoot = 3.5,
     StandBase  = 6.0,
@@ -492,26 +495,30 @@ local CFG = {
     HideSprint = false,
   },
 
-  -- ОТБРОС ЧЕРЕЗ РАССИНХРОН СКОРОСТИ.
-  -- Три способа, потому что движок затыкает их по очереди и что именно живо
-  -- сейчас — проверяется только на месте. Наше настоящее тело закреплено,
-  -- сталкивается ProxyCharacter — работаем с ним.
-  Fling = {
-    Enabled  = false,
-    Method   = "Velocity",
-    Power    = 90000,
-    Radius   = 14,
-    Duration = 1.20,
-    Foes     = true,   -- только соперники, иначе любой ближайший игрок
-    SimBoost = true,   -- поднять SimulationRadius, без него часто не берёт
-  },
-
   Vis = {
     Zones    = false,  -- круги зон работы на площадке
-    Path     = false,  -- стрелки: куда скрипт ведёт и что делает
+    Path     = false,  -- дорожка: куда скрипт ведёт и что делает
     Segments = 40,
     Thick    = 2,
     Labels   = true,
+    -- Подъём над полом. Сам пол ищем лучом вниз, а не по lastValidHeight:
+    -- на разноуровневых площадках парка тот отстаёт, и рисунок уезжал вверх.
+    Lift     = 0.10,
+    -- Каждый визуал отключается отдельно.
+    Show = { Spoof = true, S3 = true, Slip = true, RimFree = true,
+             Defend = true, Catch = true },
+    Col = {
+      Spoof   = Color3.fromRGB(255, 170,  40),
+      S3      = Color3.fromRGB( 80, 220, 255),
+      Slip    = Color3.fromRGB(255,  90, 160),
+      RimFree = Color3.fromRGB(120, 255, 120),
+      Defend  = Color3.fromRGB(255, 210,  70),
+      Catch   = Color3.fromRGB( 90, 255, 140),
+      Path    = Color3.fromRGB( 90, 190, 255),
+    },
+    PathByOwner = true,   -- цвет дорожки по тому, кто рулит
+    PathWidth   = 1.2,    -- ширина дорожки в студах
+    PathFlow    = true,   -- бегущие поперечины
   },
 
   AntiDef = {
@@ -527,7 +534,12 @@ local CFG = {
     Mode      = "Legit",
     Dribble     = false,
     DribbleCombo= "X",     -- Dribbling.Input.X = StepBack на обе руки
-    DribbleCD   = 1.2,
+    -- Ускорение от хода живёт 1.5 с (Base:140/:144), а сам ход на это время
+    -- отбирает управление движением. Чаще слать нечего и вредно.
+    DribbleCD   = 2.0,
+    -- Свой порог срабатывания: React = 14 это «меня накрывают перед броском»,
+    -- под него попадает почти любой кадр с мячом. Для хода нужен прессинг.
+    DribbleRange= 7.0,
     BackTPMax   = 12,
 
     -- ── ОТШАГ ПЕРЕД БРОСКОМ (режим Legit) ──
@@ -1230,6 +1242,15 @@ end
 
 PBX.PASS_WAIT = { CatchingPass = true, AwaitingPass = true,
                   CatchingLob = true, PassTransition = true }
+-- Покадровый мемо: сам обход идёт по всем игрокам и читает по два атрибута
+-- на каждого, а спрашивают его из кадровых веток.
+PBX.passMemo = { f = -1, ball = nil, rcv = nil }
+function PBX.passToCached(ball)
+  local P = PBX.passMemo
+  if P.f == HUB.frame and P.ball == ball then return P.rcv end
+  P.f, P.ball, P.rcv = HUB.frame, ball, PBX.passTo(ball)
+  return P.rcv
+end
 function PBX.passTo(ball)
   if not ball then return nil end
   for _, c in ipairs(charsList()) do
@@ -2974,7 +2995,12 @@ local function tf(reason)
 end
 HUB.trajFunnel = TF
 
-track(RunService.RenderStepped:Connect(LPH_NO_VIRTUALIZE(function()
+-- ОТРИСОВКА ТРАЕКТОРИИ ТОЖЕ ПЕРЕЕХАЛА В ШАГ ПОСЛЕ КАМЕРЫ.
+-- Она висела на RenderStepped, а там камера за этот кадр ЕЩЁ НЕ ОБНОВЛЕНА:
+-- линии, привязанные к миру, отставали ровно на кадр. При шифтлоке камера
+-- крутится непрерывно, и отставание читается как постоянный сдвиг рисунка.
+-- Вызывается из общей привязки рядом с зонами (ниже по файлу).
+PBX.drawTraj = LPH_NO_VIRTUALIZE(function()
   tf("frames")
   if not (CFG.Traj.Enabled and HUB.running) then
     tf(CFG.Traj.Enabled and "script stopped" or "toggle off"); hideAll(); return
@@ -3057,34 +3083,21 @@ track(RunService.RenderStepped:Connect(LPH_NO_VIRTUALIZE(function()
       end
     end
   end
-end)))
+end)
 
 -- ВИЗУАЛЫ ЗОН И МАРШРУТА.
 -- Свой пул объектов Drawing, отдельный от траектории: тот индексируется
--- точками дуги и перебирается целиком на каждый кадр. Экономия та же самая —
--- объекты создаются ОДИН раз и переиспользуются, лишние просто прячутся, а
--- каждая вершина проецируется на экран по одному разу, а не по два.
+-- точками дуги и перебирается целиком на каждый кадр. Объекты создаются один
+-- раз и переиспользуются, лишние прячутся, а каждая вершина проецируется на
+-- экран по одному разу, а не по два.
 local VZ = { lines = {}, texts = {}, nL = 0, nT = 0, cam = nil,
-  col = {
-    spoof   = Color3.fromRGB(255, 170,  40),   -- порог включения подмены
-    fake    = Color3.fromRGB(150, 100,  20),   -- куда подмена нас ставит
-    s3      = Color3.fromRGB( 80, 220, 255),   -- цель Smart 3PT
-    s3reach = Color3.fromRGB( 35, 110, 130),   -- откуда он ещё дотянет
-    slip    = Color3.fromRGB(255,  90, 160),   -- зона работы Contact Slip
-    rimfree = Color3.fromRGB(120, 255, 120),   -- у кольца курс не гнём
-    grab    = Color3.fromRGB( 90, 255, 140),
-    automove= Color3.fromRGB( 90, 190, 255),
-    defense = Color3.fromRGB(255, 210,  70),
-    anti    = Color3.fromRGB(255, 120, 120),
-    s3path  = Color3.fromRGB( 80, 220, 255),
-    other   = Color3.fromRGB(220, 220, 220),
-  } }
+             floorY = nil, floorAt = 0 }
 
 function VZ.line()
   VZ.nL += 1
-  -- Потолок на всякий случай: рисуем кругами, и если кто-то выкрутит
-  -- Smoothness вместе с пятью зонами, пул не должен расти без предела.
-  if VZ.nL > 420 then return nil end
+  -- Потолок на всякий случай: рисуем кругами, и если выкрутить Smoothness
+  -- вместе со всеми зонами, пул не должен расти без предела.
+  if VZ.nL > 460 then return nil end
   local l = VZ.lines[VZ.nL]
   if l == nil then
     local ok, d = pcall(function()
@@ -3101,6 +3114,7 @@ end
 
 function VZ.textObj()
   VZ.nT += 1
+  if VZ.nT > 24 then return nil end
   local t = VZ.texts[VZ.nT]
   if t == nil then
     local ok, d = pcall(function()
@@ -3126,6 +3140,35 @@ function VZ.hideFrom(nl, nt)
 end
 function VZ.hideAll() VZ.hideFrom(0, 0); VZ.nL, VZ.nT = 0, 0 end
 
+-- ПОЛ ИЩЕМ ЛУЧОМ ВНИЗ, А НЕ ПО lastValidHeight.
+-- Тот атрибут — высота, на которую игра САМА ставит персонажа, и на
+-- разноуровневой площадке он отстаёт от реального пола под ногами: рисунок
+-- уезжал вверх, что и было видно. Луч даёт точную высоту прямо под нами.
+function VZ.floor()
+  local now = os.clock()
+  if VZ.floorY and (now - VZ.floorAt) < 0.20 then return VZ.floorY end
+  local me = selfPos()
+  if not me then return VZ.floorY end
+  VZ.floorAt = now
+  VZ.rp = VZ.rp or RaycastParams.new()
+  local pc = proxyPart()
+  if VZ.rpProxy ~= pc then
+    VZ.rp.FilterType = Enum.RaycastFilterType.Exclude
+    local list = {}
+    local ch = sChild(Workspace, "Characters");  if ch then list[#list+1] = ch end
+    local bb = sChild(Workspace, "Basketballs"); if bb then list[#list+1] = bb end
+    if pc then list[#list+1] = pc end
+    VZ.rp.FilterDescendantsInstances = list
+    VZ.rpProxy = pc
+  end
+  local ok, hit = pcall(function()
+    return Workspace:Raycast(me + Vector3.new(0, 2, 0), Vector3.new(0, -26, 0), VZ.rp)
+  end)
+  if ok and hit then VZ.floorY = hit.Position.Y
+  else VZ.floorY = groundLevel() or (me.Y - 3) end
+  return VZ.floorY
+end
+
 function VZ.seg(a, b, col, thick)
   local cam = VZ.cam; if not cam then return end
   local l = VZ.line(); if not l then return end
@@ -3142,11 +3185,11 @@ function VZ.seg(a, b, col, thick)
   end
 end
 
--- Круг на плоскости площадки. Точки проецируем по одной на вершину, а не по
--- две на отрезок: при сорока сегментах это 41 вызов вместо 80.
-function VZ.ring(c, rad, col, y)
-  local cam = VZ.cam; if not (cam and rad and rad > 0.5) then return end
-  local n = math.clamp(math.floor(CFG.Vis.Segments), 8, 64)
+-- Круг на плоскости пола. Точки проецируем по одной на вершину, а не по две
+-- на отрезок: при сорока сегментах это 41 вызов вместо 80.
+function VZ.ring(c, rad, col, y, n)
+  local cam = VZ.cam; if not (cam and rad and rad > 0.3) then return end
+  n = math.clamp(math.floor(n or CFG.Vis.Segments), 6, 64)
   local step = math.pi * 2 / n
   local py = y or c.Y
   local sPrev, onPrev = cam:WorldToViewportPoint(Vector3.new(c.X + rad, py, c.Z))
@@ -3177,34 +3220,43 @@ function VZ.label(pos, str, col)
   else t.Visible = false end
 end
 
--- Дорожка как в Baritone: сплошная линия плюс шевроны по ходу движения.
--- Шеврон рисуется двумя отрезками назад-в-стороны от точки на маршруте, так
--- что направление читается с любого ракурса.
-function VZ.arrows(from, to, col, y)
+-- ДОРОЖКА ВМЕСТО РОССЫПИ СТРЕЛОК.
+-- Прошлый вариант рисовал линию и «галочки» назад-в-стороны от неё, и вместе
+-- с крестом на цели это читалось как мусор. Здесь честная дорожка: две
+-- направляющие по краям, поперечины между ними и кольцо с мачтой на цели.
+-- Поперечины сдвигаются по времени, поэтому направление видно сразу и без
+-- наконечников — так же читается путь в Baritone.
+function VZ.path(from, to, col, y)
   local d = (to - from) * FLAT
   local len = d.Magnitude
-  if len < 0.6 then return end
+  if len < 0.8 then return end
   local u = d.Unit
+  local right = Vector3.new(-u.Z, 0, u.X) * (CFG.Vis.PathWidth * 0.5)
   local a = Vector3.new(from.X, y, from.Z)
   local b = Vector3.new(to.X, y, to.Z)
-  VZ.seg(a, b, col, CFG.Vis.Thick + 1)
-  local right = Vector3.new(-u.Z, 0, u.X)
-  local at, guard = 2.5, 0
-  while at < len and guard < 32 do
+  VZ.seg(a + right, b + right, col)
+  VZ.seg(a - right, b - right, col)
+  local step = 2.0
+  local at = CFG.Vis.PathFlow and ((os.clock() * 5) % step) or step * 0.5
+  local guard = 0
+  while at < len and guard < 36 do
     guard += 1
     local p = a + u * at
-    VZ.seg(p, p - u * 1.5 + right * 0.95, col)
-    VZ.seg(p, p - u * 1.5 - right * 0.95, col)
-    at += 3.0
+    VZ.seg(p - right, p + right, col)
+    at += step
   end
-  -- метка самой цели: маленький крест, чтобы точка была видна и вплотную
-  VZ.seg(b - right * 1.1, b + right * 1.1, col)
-  VZ.seg(b - u * 1.1, b + u * 1.1, col)
-  VZ.seg(b, b + Vector3.new(0, 2.2, 0), col)
+  VZ.ring(b, CFG.Vis.PathWidth, col, y, 14)
+  VZ.seg(b, b + Vector3.new(0, 2.6, 0), col)
 end
 
 function VZ.ownerColor(o)
-  return VZ.col[o] or VZ.col.other
+  local C = CFG.Vis.Col
+  if not CFG.Vis.PathByOwner then return C.Path end
+  if o == "grab" then return C.Catch
+  elseif o == "defense" then return C.Defend
+  elseif o == "anti" then return C.Slip
+  elseif o == "s3" then return C.S3 end
+  return C.Path
 end
 
 -- Что скрипт СЕЙЧАС делает — берём объяснение того владельца, который рулит.
@@ -3217,8 +3269,7 @@ function VZ.ownerWhy(o)
   return nil
 end
 
-track({ Disconnect = function() pcall(VZ.hideAll) end })
-track(RunService.RenderStepped:Connect(function()
+function VZ.draw()
   local V = CFG.Vis
   if not (HUB.running and Drawing and (V.Zones or V.Path)) then
     if VZ.nL > 0 or VZ.nT > 0 then pcall(VZ.hideAll) end
@@ -3229,51 +3280,76 @@ track(RunService.RenderStepped:Connect(function()
   VZ.cam, VZ.nL, VZ.nT = cam, 0, 0
 
   local me = selfPos()
-  -- Пол площадки: lastValidHeight у игры это высота, на которую она сама
-  -- ставит персонажа. Если её нет — берём свои ноги.
-  local gy = (groundLevel() or ((me and me.Y or 0) - 3)) + 0.15
+  local gy = (VZ.floor() or 0) + V.Lift
+  local S, C = V.Show, V.Col
+  -- Второстепенные оттенки не отдельные настройки, а притушенный основной
+  -- цвет: меняешь один — вся пара остаётся согласованной.
+  local function dim(c) return Color3.new(c.R * 0.55, c.G * 0.55, c.B * 0.55) end
 
   if V.Zones then
     local hp = me and nearestHoop(me) or nil
     if hp then
-      if CFG.Spoof.Enabled then
+      if S.Spoof and CFG.Spoof.Enabled then
         -- Дальше этой черты подмена дистанции включается, ближе — молчит.
-        VZ.ring(hp, CFG.Spoof.MinRealDist, VZ.col.spoof, gy)
-        VZ.label(hp + Vector3.new(0, 2.5, -CFG.Spoof.MinRealDist),
-          ("spoof from %.0f stds"):format(CFG.Spoof.MinRealDist), VZ.col.spoof)
+        VZ.ring(hp, CFG.Spoof.MinRealDist, C.Spoof, gy)
+        VZ.label(Vector3.new(hp.X, gy + 1.6, hp.Z - CFG.Spoof.MinRealDist),
+          ("spoof from %.0f"):format(CFG.Spoof.MinRealDist), C.Spoof)
         -- И куда она нас ставит на регистрации.
-        VZ.ring(hp, CFG.Spoof.FakeDist, VZ.col.fake, gy)
-        VZ.label(hp + Vector3.new(0, 1.5, -CFG.Spoof.FakeDist),
-          ("shown at %.0f"):format(CFG.Spoof.FakeDist), VZ.col.fake)
+        VZ.ring(hp, CFG.Spoof.FakeDist, dim(C.Spoof), gy)
+        VZ.label(Vector3.new(hp.X, gy + 1.6, hp.Z - CFG.Spoof.FakeDist),
+          ("shown at %.0f"):format(CFG.Spoof.FakeDist), dim(C.Spoof))
       end
-      if CFG.S3.Enabled then
-        -- Цель: линия плюс поля безопасности, ровно как в расчёте броска.
+      if S.S3 and CFG.S3.Enabled then
         local need = CFG.S3.LineDist + 0.95 + CFG.S3.Extra
-        VZ.ring(hp, need, VZ.col.s3, gy)
-        VZ.label(hp + Vector3.new(need, 2.5, 0),
-          ("3pt target %.1f"):format(need), VZ.col.s3)
-        -- И откуда он ещё дотянет: ближе этого кольца уже не вытащит.
+        VZ.ring(hp, need, C.S3, gy)
+        VZ.label(Vector3.new(hp.X + need, gy + 1.6, hp.Z),
+          ("3pt target %.1f"):format(need), C.S3)
         local from = need - CFG.S3.Window
         if from > 1 then
-          VZ.ring(hp, from, VZ.col.s3reach, gy)
-          VZ.label(hp + Vector3.new(from, 1.5, 0),
-            ("reach from %.1f"):format(from), VZ.col.s3reach)
+          VZ.ring(hp, from, dim(C.S3), gy)
+          VZ.label(Vector3.new(hp.X + from, gy + 1.6, hp.Z),
+            ("reach from %.1f"):format(from), dim(C.S3))
         end
       end
-      if CFG.Move.Slip.Enabled and CFG.Move.RimFree > 0 then
+      if S.RimFree and CFG.Move.Slip.Enabled and CFG.Move.RimFree > 0 then
         -- Внутри этого круга курс не гнём вообще, чтобы разгон в данк уцелел.
-        VZ.ring(hp, CFG.Move.RimFree, VZ.col.rimfree, gy)
+        VZ.ring(hp, CFG.Move.RimFree, C.RimFree, gy)
       end
     end
-    if CFG.Move.Slip.Enabled and me then
+    if S.Slip and CFG.Move.Slip.Enabled and me then
       -- Зона работы обхода. В режиме Feint это радиус, с которого он вообще
       -- начинает читать соперников; в Default — радиус контакта, помноженный
       -- на Start Distance, то есть расстояние, с которого начинается увод.
-      local S = CFG.Move.Slip
-      local r = (S.Mode == "Feint") and S.ReactRadius or (2.0 * 1.2 * S.StartMul)
-      VZ.ring(me, r, VZ.col.slip, gy)
-      VZ.label(me + Vector3.new(0, 2.5, -r),
-        ("slip %s %.1f"):format(tostring(S.Mode), r), VZ.col.slip)
+      local SL = CFG.Move.Slip
+      local r = (SL.Mode == "Feint") and SL.ReactRadius or (2.0 * 1.2 * SL.StartMul)
+      VZ.ring(me, r, C.Slip, gy)
+      VZ.label(Vector3.new(me.X, gy + 1.6, me.Z - r),
+        ("slip %s %.1f"):format(tostring(SL.Mode), r), C.Slip)
+    end
+    -- ЗАЩИТА: линия «подопечный — наше кольцо» и точка, куда мы встаём.
+    -- По ней сразу видно, действительно ли мы закрываем кольцо, или стоим
+    -- сбоку — то, ради чего вся правка геометрии и делалась.
+    if S.Defend and CFG.Defense.Enabled and HUB.defTargetPos and HUB.defSpot then
+      local tp, sp = HUB.defTargetPos, HUB.defSpot
+      local dh = hoopWeDefend()
+      if dh then
+        VZ.seg(Vector3.new(tp.X, gy, tp.Z), Vector3.new(dh.X, gy, dh.Z), C.Defend)
+      end
+      VZ.ring(Vector3.new(sp.X, gy, sp.Z), 1.1, C.Defend, gy, 14)
+      VZ.seg(Vector3.new(sp.X, gy, sp.Z), Vector3.new(sp.X, gy + 2.4, sp.Z), C.Defend)
+      VZ.ring(Vector3.new(tp.X, gy, tp.Z), 0.8, C.Defend, gy, 10)
+      if HUB.defOffLine then
+        VZ.label(Vector3.new(sp.X, gy + 3.0, sp.Z),
+          ("guard %.1f off line"):format(HUB.defOffLine), C.Defend)
+      end
+    end
+    -- ПЕРЕХВАТ: точка, в которой скрипт рассчитывает взять мяч.
+    if S.Catch and CFG.Grab.Enabled and HUB.grabPoint
+       and (os.clock() - (HUB.grabPointAt or 0)) < 0.4 then
+      local p = HUB.grabPoint
+      VZ.ring(Vector3.new(p.X, gy, p.Z), 1.4, C.Catch, gy, 16)
+      VZ.seg(Vector3.new(p.X, gy, p.Z), p, C.Catch)
+      VZ.ring(p, 0.9, C.Catch, p.Y, 12)
     end
   end
 
@@ -3287,16 +3363,47 @@ track(RunService.RenderStepped:Connect(function()
         goal = me + HUB.navDir.Unit * 10
       end
       if goal then
-        VZ.arrows(me, goal, col, gy)
+        VZ.path(me, goal, col, gy)
         local why = VZ.ownerWhy(owner)
-        VZ.label(Vector3.new(goal.X, gy + 3.2, goal.Z),
+        VZ.label(Vector3.new(goal.X, gy + 3.4, goal.Z),
           why and (owner .. ": " .. tostring(why)) or owner, col)
       end
     end
   end
 
   VZ.hideFrom(VZ.nL, VZ.nT)
-end))
+end
+
+-- РИСУЕМ ПОСЛЕ ТОГО, КАК КАМЕРА УЖЕ ОБНОВЛЕНА ЗА ЭТОТ КАДР.
+-- В RenderStepped камера ещё СТАРАЯ: движок обновляет её позже, и линии,
+-- привязанные к миру, отстают ровно на кадр. При шифтлоке камера крутится
+-- непрерывно, поэтому отставание видно как постоянный сдвиг рисунка вбок.
+-- BindToRenderStep с приоритетом сразу ПОСЛЕ Camera выполняется уже с
+-- обновлённой камерой — сдвига нет. Если метод недоступен, откатываемся на
+-- Heartbeat: он тоже идёт после камеры, просто на кадр позже отрисовки.
+do
+  -- Один шаг отрисовки на всё: дуга мяча и зоны с дорожкой. Так они гаранти-
+  -- рованно берут ОДНУ И ТУ ЖЕ камеру и не расходятся между собой.
+  local function drawFrame()
+    if PBX.drawTraj then pcall(PBX.drawTraj) end
+    VZ.draw()
+  end
+  local bound = false
+  local okb = pcall(function()
+    RunService:BindToRenderStep("PBVisuals",
+      Enum.RenderPriority.Camera.Value + 1, drawFrame)
+    bound = true
+  end)
+  if okb and bound then
+    track({ Disconnect = function()
+      pcall(function() RunService:UnbindFromRenderStep("PBVisuals") end)
+      pcall(VZ.hideAll)
+    end })
+  else
+    track(RunService.Heartbeat:Connect(drawFrame))
+    track({ Disconnect = function() pcall(VZ.hideAll) end })
+  end
+end
 
 function PBX.predSlack(tAhead)
   local q = HUB.predQ and HUB.predQ.shot
@@ -3649,6 +3756,18 @@ local function doJump(why, ballPos, dt, P, tPred, dy)
 
   if type(dy) == "number" and dy > -900 and dy < CFG.Grab.NoJumpDy then
     HUB.blockWhy = ("no jump needed, ball only %+.1f up"):format(dy)
+    return
+  end
+  -- ВЕРХНЕЙ ГРАНИЦЫ ЗДЕСЬ НЕ БЫЛО ВООБЩЕ.
+  -- В журнале два прыжка с dy 14.4 и 14.8 при досягаемости 8.1 — мяч висел
+  -- вдвое выше, чем мы можем достать, а прыжок всё равно уходил. Он не просто
+  -- бесполезен: он съедает Jump Cooldown, и настоящий шанс через полсекунды
+  -- прыгнуть уже не может. Отсюда одновременно и «ложные прыжки», и «не
+  -- успевает». Проверка стоит здесь, в одной точке на все ветки.
+  local reach = JP.reachY()
+  if type(dy) == "number" and dy > reach + 0.5 then
+    HUB.blockWhy = ("no jump, ball %.1f up and we reach %.1f"):format(dy, reach)
+    PBX.gs("refused: ball above reach", dy - reach)
     return
   end
   HUB.lastJump = os.clock()
@@ -4637,10 +4756,41 @@ track(RunService.Heartbeat:Connect(function()
   if not (HUB.running and A.Enabled and A.Dribble and R.Drib) then
     HUB.antiDrib = nil; return
   end
-  if not hasBall(chr()) then HUB.antiDrib = "no ball in hand"; return end
+  local c = chr()
+  if not hasBall(c) then HUB.antiDrib = "no ball in hand"; return end
   if PBX.shotBusy() then HUB.antiDrib = "shot in progress, input would cancel it"; return end
-  if sAttr(chr(), "Stunned") == true then HUB.antiDrib = "stunned"; return end
+  if sAttr(c, "Stunned") == true then HUB.antiDrib = "stunned"; return end
+
+  -- ПОЧЕМУ ЗДЕСЬ ТЕПЕРЬ СТОЛЬКО ПРОВЕРОК, И КАЖДАЯ ИЗ КОДА ИГРЫ.
+  -- Base_ModuleScript:108-123: пока идёт дриббл-ход, у персонажа CanMove
+  -- выставлен в false, и скорость целиком ведёт сама игра через WalkSpring.
+  -- То есть каждый лишний пакет — это НОВАЯ блокировка движения поверх
+  -- предыдущей. Именно так выглядят «баганные дриблы, которые повторяются
+  -- раз за разом»: 61 отправка за сессию при кулдауне 1.2 с.
+  -- Base:140 и :144 показывают и цену вопроса: ускорение от хода живёт 1.5 с,
+  -- значит чаще этого слать бессмысленно даже когда он проходит.
+  local act = sAttr(c, "Action")
+  if act == "Dribbling" then HUB.antiDrib = "a move is already running"; return end
+  if act ~= nil and act ~= "" and act ~= "Moving" then
+    HUB.antiDrib = ("busy: %s"):format(tostring(act)); return
+  end
+  if sAttr(c, "Debounce") == true then HUB.antiDrib = "game cooldown"; return end
+  if sAttr(c, "CanMove") == false then HUB.antiDrib = "server holds movement"; return end
   if os.clock() - (HUB.antiDribAt or 0) < A.DribbleCD then return end
+
+  -- ХОД ИМЕЕТ СМЫСЛ ТОЛЬКО В ДВИЖЕНИИ.
+  -- Стоя на месте он даёт одну лишь блокировку: разрывать нечего, уходить
+  -- некуда. Сырой ввод игрока цел в lastMoveDirection (Movement:184) даже
+  -- когда MoveDirection уже подменён игрой или нами.
+  local dir = nil
+  local m = HUB.mov
+  if m then
+    local okr, raw = pcall(RDR.lastMoveDirection, m)
+    if okr and typeof(raw) == "Vector3" and raw.Magnitude > 0.1 then dir = raw end
+  end
+  if not dir then
+    HUB.antiDrib = "standing still, a move would only lock you"; return
+  end
 
   local me = selfPos(); if not me then return end
   local foe, best = nil, nil
@@ -4653,24 +4803,16 @@ track(RunService.Heartbeat:Connect(function()
     if not best or d < best then foe, best = e.p, d end
   end
   if not foe then HUB.antiDrib = "nobody near"; return end
-  if best > A.React then
-    HUB.antiDrib = ("nearest %.1f stds, triggers under %.0f"):format(best, A.React)
+  -- СВОЙ ПОРОГ, А НЕ React ОТ ОТШАГА.
+  -- React = 14 студов отвечает на вопрос «стоит ли уходить перед броском», и
+  -- под него попадает почти каждый кадр с мячом в руках. Для хода нужен
+  -- реальный прессинг вплотную.
+  if best > A.DribbleRange then
+    HUB.antiDrib = ("nearest %.1f, triggers under %.0f"):format(best, A.DribbleRange)
     return
   end
 
   HUB.antiDribAt = os.clock()
-  -- Игра передаёт lastMoveDirection — СЫРОЙ ввод игрока (Movement:184), он
-  -- цел даже когда MoveDirection уже подменён игрой или нами.
-  local dir = Vector3.new()
-  local m = HUB.mov
-  if m then
-    local okr, raw = pcall(RDR.lastMoveDirection, m)
-    if okr and typeof(raw) == "Vector3" then dir = raw end
-  end
-  if dir.Magnitude < 0.05 then
-    local away = (me - foe) * FLAT
-    dir = (away.Magnitude > 0.1) and away.Unit or Vector3.new(0,0,1)
-  end
   local sprint = false
   pcall(function() sprint = UIS:IsKeyDown(Enum.KeyCode.LeftShift) end)
   HUB.bypass = true
@@ -5585,6 +5727,18 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
       -- судьи: взять его нельзя, а тик всё равно вёл нас к нему.
       local loose = (BALL.holder == nil) and not PBX.ballIsOurs()
                     and ((not CFG.Grab.OnlyInMatch) or PBX.matchLive())
+      -- ПАС, АДРЕСОВАННЫЙ ДРУГОМУ, ЛОВИТЬ НЕЧЕГО.
+      -- Ветка смотрела только на «мяч свободен и рядом с кольцом», а передача
+      -- над кольцом попадает под это описание целиком. Отсюда прыжки на чужой
+      -- пас. Игра сама помечает получателя: у него Action из PASS_WAIT и
+      -- TargetBasketball указывает на этот мяч.
+      if loose and BALL.part then
+        local rcv = PBX.passToCached(BALL.part)
+        if rcv and rcv ~= chr() then
+          loose = false
+          PBX.gs("rim catch: pass addressed to someone else")
+        end
+      end
       if CFG.Grab.RimCatch and BALL.pos and loose then
         local bp = (ballTrueNow(BALL.pos, BALL.vel, BALL.stale)) or BALL.pos
         local bH = ((bp - hp) * FLAT).Magnitude
@@ -5614,19 +5768,33 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
                 -- Подробности в JP.timeToReach: отвесно падающий мяч имел
                 -- нулевую горизонтальную скорость сближения и ранний прыжок
                 -- не запускался вовсе.
-                local lead = JP.jumpLead(dyB)
                 local myV = charVel(chr())
                 local dirNow = HUB.moveWorld
                 if typeof(dirNow) == "Vector3" and dirNow.Magnitude > 0.1 then
                   myV = dirNow.Unit * ourSpeed()
                 end
-                local tIn = JP.timeToReach(bp, BALL.vel, me, myV,
-                                           CFG.Grab.RimCatchJump, lead + 0.35)
-                if tIn and tIn <= lead then
-                  HUB.blockWhy = ("rim catch: jumping %.0f ms early, ball in %.0f ms")
-                    :format(lead*1000, tIn*1000)
+                -- Окно поиска считаем от САМОГО ДОЛГОГО осмысленного прыжка:
+                -- упреждение для текущей высоты тут не годится, высота ещё
+                -- изменится, пока мяч летит.
+                local win = JP.jumpLead(JP.reachY()) + 0.35
+                local tIn, qAt = JP.timeToReach(bp, BALL.vel, me, myV,
+                                                CFG.Grab.RimCatchJump, win)
+                -- ВЫСОТУ БЕРЁМ В ТОЧКЕ ХВАТА, А НЕ СЕЙЧАС.
+                -- Здесь стояла dyB — разница высот В МОМЕНТ РЕШЕНИЯ. По ней
+                -- считалось и упреждение, и она же уходила в журнал: оттуда
+                -- записи dy 14.4 при досягаемости 8.1. И точка P для замера
+                -- тоже была текущая, поэтому arrErr всегда выходил равным
+                -- минус упреждению — цифра, по которой ничего не понять.
+                local dyAt = qAt and (qAt.Y - me.Y) or nil
+                local lead = dyAt and JP.jumpLead(dyAt) or nil
+                if tIn and dyAt and lead and dyAt >= -2 and dyAt <= JP.reachY()
+                   and tIn > 0.03 and tIn <= lead then
+                  HUB.grabPoint, HUB.grabPointAt = qAt, os.clock()
+                  local why = ("rim catch: jumping %.0f ms early, ball in %.0f ms, dy %+.1f")
+                    :format(lead*1000, tIn*1000, dyAt)
+                  HUB.blockWhy = why
                   PBX.gs("rim catch jump early", tIn)
-                  doJump(HUB.blockWhy, bp, dt, bp, tIn, dyB)
+                  doJump(why, qAt, dt, qAt, tIn, dyAt)
                   return
                 end
               end
@@ -5983,6 +6151,7 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
 
   PBX.why("grabWhy", "catch in %.0f ms, %.1f stds away, dy %+.1f",
           pickT * 1000, pickRun, pickDy)
+  HUB.grabPoint, HUB.grabPointAt = pick, os.clock()
 
   -- ЦЕЛЬ ХОДЬБЫ СМЕЩАЕМ ВПЕРЁД ПО ДУГЕ, А ЦЕЛЬ ВЗГЛЯДА ОСТАВЛЯЕМ НА МЯЧЕ.
   -- Смотрим туда, где мяч будет в момент хвата, но ногами идём чуть дальше:
@@ -6126,6 +6295,8 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
     releaseG()
     stopSteer("defense")
     HUB.defActive = false
+    HUB.defSpeed, HUB.defSpeedUntil = nil, nil
+    HUB.defTargetPos, HUB.defSpot = nil, nil
   end
   if not CFG.Defense.Enabled then defOff(); return end
 
@@ -6192,6 +6363,8 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
     local lim = CFG.Defense.StandBase + CFG.Defense.BlowbyAhead
     if off.Magnitude > lim then spot = tp + off.Unit * lim end
   end
+  -- Для визуала защиты: где подопечный и куда мы встаём.
+  HUB.defTargetPos, HUB.defSpot = tp, spot
 
   local flat = (spot - me) * FLAT
   local gap  = flat.Magnitude
@@ -6236,6 +6409,17 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
   end
   steerToDir(out, sprint, "defense")
   HUB.defActive = true
+  -- СКОРОСТЬ ЗАЩИТЫ ЗАДАЁТСЯ НАПРЯМУЮ.
+  -- Игровой потолок ходьбы 14 плюс спринт 3.35 (Base:85), а точка защиты
+  -- почти всегда позади подопечного: пешком за проходом не успеть в принципе.
+  -- Пишем скорость в MovementVelocity, как это делает отшаг Anti Defense.
+  -- 0 означает «не вмешиваться», и это значение по умолчанию.
+  if CFG.Defense.MoveSpeed and CFG.Defense.MoveSpeed > 0 then
+    HUB.defSpeed = CFG.Defense.MoveSpeed
+    HUB.defSpeedUntil = os.clock() + 0.15
+  else
+    HUB.defSpeed, HUB.defSpeedUntil = nil, nil
+  end
 
   -- РАЗВОРОТ НА ПОДОПЕЧНОГО, И ОН ЖЕ ЧИНИТ ДРОПДАУН Face.
   -- Ходьба задавалась, а поворот нет: тело оставалось там, куда его развернул
@@ -6732,9 +6916,10 @@ local function save()
     hideSprint = CFG.Zero.HideSprint, sprintHidden = HUB.sprintHidden,
     wantSprint = HUB.wantSprint,
     defOffLine = HUB.defOffLine, defLeadMax = CFG.Defense.LeadMax,
-    flingOn = CFG.Fling.Enabled, flingMethod = CFG.Fling.Method,
-    flingWhy = HUB.flingWhy, flingN = HUB.flingN,
-    visZones = CFG.Vis.Zones, visPath = CFG.Vis.Path,
+    visZones = CFG.Vis.Zones, visPath = CFG.Vis.Path, visLift = CFG.Vis.Lift,
+    visFloor = VZ and VZ.floorY or nil,
+    defMoveSpeed = CFG.Defense.MoveSpeed,
+    antiDribRange = CFG.AntiDef.DribbleRange, antiDribCD = CFG.AntiDef.DribbleCD,
     navOwner = HUB.navOwner,
     blatantJumpN = BL and BL.jumpN or nil,
     blatantRimGuess = CFG.Blatant.RimGuess,
@@ -7390,6 +7575,8 @@ local function installVelHook()
               -- На броске скорость всегда наша: игровая ветка сюда не дошла.
               want = M.Speed.Enabled and M.Speed.Value or baseSpeedNoPenalty()
             elseif M.Speed.Enabled then want = M.Speed.Value
+            elseif HUB.defSpeed and os.clock() < (HUB.defSpeedUntil or 0) then
+              want = HUB.defSpeed
             elseif M.Strafe.Enabled or M.Sprint.Enabled or M.Preset.Enabled
                 or (CFG.Zero.Enabled and CFG.Zero.HideSprint) then
               -- Скрытый спринт обязан САМ вернуть отобранную прибавку:
@@ -7578,130 +7765,6 @@ track(RunService.Heartbeat:Connect(function()
     end
   end
   HUB.noclipParts = #list
-end))
-
--- ОТБРОС. ТРИ СПОСОБА, ПОТОМУ ЧТО ЖИВЁТ ИЗ НИХ КАЖДЫЙ РАЗ РАЗНОЕ.
--- Механика одна на все три. Клиент владеет физикой СВОЕЙ сборки (network
--- ownership), и экстремальные значения скорости на ней попадают в общий
--- решатель столкновений. Чужой персонаж принадлежит чужому клиенту, но
--- контакт всё равно считается обеими сторонами — отсюда и отброс. Документация
--- Roblox называет это прямо: владелец может выставить Inf или NaN и «помешать
--- физике других сборок, даже тех, которыми не владеет».
--- Наше настоящее тело закреплено, сталкивается ProxyCharacter — работаем с ним.
---   Velocity — знакопеременная линейная и угловая скорость: положение почти
---              не плывёт, а импульс в момент контакта огромен.
---   Spin     — классическая раскрутка одной угловой скоростью.
---   Teleport — рассинхрон ПОЛОЖЕНИЯ: кадр у цели, кадр далеко. Остаётся
---              рабочим там, где скорость подрезают на входе.
--- Пока тумблер включён, отброс идёт вспышками: Duration работы, потом пауза,
--- потом снова. Так его видно и им можно управлять, не ловя один кадр.
-local FL = { on = false, cf = nil, until_ = 0, nextAt = 0, flip = 1, tgt = nil }
-
--- Постановка без обнуления скорости: tpProxy для этого не годится, он гасит
--- AssemblyLinearVelocity, то есть ровно то, ради чего всё и затевается.
-function PBX.flingPlace(pc, pos)
-  pc.CFrame = CFrame.new(pos)
-  local bp = pc:FindFirstChild("BodyPosition"); if bp then bp.Position = pos end
-  local mv = pc:FindFirstChild("MovementVelocity")
-  if mv then mv.Velocity = Vector3.new() end
-  local ph = pc:FindFirstChild("Physics")
-  local ap = ph and ph:FindFirstChild("AlignPosition")
-  if ap and ap.Mode == Enum.PositionAlignmentMode.OneAttachment then
-    ap.Position = pos
-  end
-end
-
-function PBX.flingTarget()
-  local me = selfPos(); if not me then return nil end
-  local F = CFG.Fling
-  local best, bd = nil, nil
-  for _, c in ipairs(charsList()) do
-    if c ~= chr() and ((not F.Foes) or isEnemy(c)) then
-      local p = posOf(sChild(c, "HumanoidRootPart"))
-      if p then
-        local d = (p - me).Magnitude
-        if d <= F.Radius and (not bd or d < bd) then best, bd = c, d end
-      end
-    end
-  end
-  return best, bd
-end
-
-function PBX.flingStop(why)
-  if not FL.on then return end
-  FL.on = false
-  FL.nextAt = os.clock() + 0.6
-  local pc = proxyPart()
-  if pc then
-    pcall(function()
-      pc.AssemblyAngularVelocity = Vector3.new()
-      pc.AssemblyLinearVelocity = Vector3.new()
-    end)
-    -- Возврат на своё место обязателен: иначе улетаем вместе с целью.
-    if FL.cf then tpProxy(pc, FL.cf) end
-  end
-  FL.cf, FL.tgt = nil, nil
-  HUB.flingWhy = why or "stopped"
-end
-
-function PBX.flingStart()
-  if FL.on or os.clock() < FL.nextAt then return end
-  local pc = proxyPart()
-  if not pc then HUB.flingWhy = "no proxy body"; return end
-  local tgt, d = PBX.flingTarget()
-  if not tgt then
-    HUB.flingWhy = ("nobody within %.0f stds"):format(CFG.Fling.Radius)
-    return
-  end
-  local okc, cf = pcall(RDR.CFrame, pc)
-  if not (okc and cf) then HUB.flingWhy = "proxy unreadable"; return end
-  if CFG.Fling.SimBoost then
-    -- Без расширенного радиуса симуляции движок часто просто не отдаёт нам
-    -- физику соседа, и любой из трёх способов молча не делает ничего.
-    pcall(function()
-      if sethiddenproperty then
-        sethiddenproperty(LP, "SimulationRadius", math.huge)
-        sethiddenproperty(LP, "MaximumSimulationRadius", math.huge)
-      end
-    end)
-  end
-  FL.on, FL.cf, FL.tgt, FL.flip = true, cf, tgt, 1
-  FL.until_ = os.clock() + CFG.Fling.Duration
-  HUB.flingN = (HUB.flingN or 0) + 1
-  HUB.flingWhy = ("%s on %s at %.1f stds (burst %d)")
-    :format(tostring(CFG.Fling.Method), tgt.Name, d or -1, HUB.flingN)
-end
-
-track({ Disconnect = function() PBX.flingStop("unloaded") end })
-track(RunService.Heartbeat:Connect(function()
-  if not HUB.running then PBX.flingStop("script stopped"); return end
-  if not CFG.Fling.Enabled then
-    if FL.on then PBX.flingStop("switched off") end
-    return
-  end
-  if not FL.on then PBX.flingStart(); return end
-  if os.clock() > FL.until_ then PBX.flingStop("burst finished"); return end
-  local pc = proxyPart(); if not pc then PBX.flingStop("proxy gone"); return end
-  local tp = FL.tgt and posOf(sChild(FL.tgt, "HumanoidRootPart"))
-  if not tp then PBX.flingStop("target gone"); return end
-
-  local F = CFG.Fling
-  local P = F.Power
-  FL.flip = -FL.flip
-  pcall(function()
-    if F.Method == "Spin" then
-      PBX.flingPlace(pc, tp)
-      pc.AssemblyAngularVelocity = Vector3.new(0, P, 0)
-      pc.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-    elseif F.Method == "Teleport" then
-      PBX.flingPlace(pc, (FL.flip > 0) and tp or (tp + Vector3.new(0, 3000, 0)))
-      pc.AssemblyLinearVelocity = Vector3.new()
-    else
-      PBX.flingPlace(pc, tp)
-      pc.AssemblyLinearVelocity  = Vector3.new(P, P, P) * FL.flip
-      pc.AssemblyAngularVelocity = Vector3.new(P, P, P) * FL.flip
-    end
-  end)
 end))
 
 track(RunService.Heartbeat:Connect(function(dt)
@@ -8135,11 +8198,11 @@ return function(_Lib, _Core)
       })
       s2:SubLabel({ Text = "stands you somewhere else only while the shot registers" })
       slider(s2, { Name = "Shoot From", Flag = "SP_Fake", Default = CFG.Spoof.FakeDist,
-        Min = 5, Max = 25, Suffix = " stds",
+        Min = 5, Max = 25,
         Callback = function(v) CFG.Spoof.FakeDist = v end,
         Desc = "the distance the server sees, counted from the hoop" })
       slider(s2, { Name = "Skip Closer Than", Flag = "SP_MinReal", Default = CFG.Spoof.MinRealDist,
-        Min = 10, Max = 60, Suffix = " stds",
+        Min = 10, Max = 60,
         Callback = function(v) CFG.Spoof.MinRealDist = v end,
         Desc = "shots nearer than this are left alone, the arc sits at 23.5" })
       slider(s2, { Name = "Lead Time", Flag = "SP_PreTime", Default = CFG.Spoof.PreTime,
@@ -8182,15 +8245,15 @@ return function(_Lib, _Core)
       }, ctx.flag("S3_Mode"))
       s2b:SubLabel({ Text = "Teleport fakes the spot | Legit walks you out for real" })
       slider(s2b, { Name = "Line Distance", Flag = "S3_Line", Default = CFG.S3.LineDist,
-        Min = 12, Max = 40, Precision = 1, Suffix = " stds",
+        Min = 12, Max = 40, Precision = 1,
         Callback = function(v) CFG.S3.LineDist = v end,
         Desc = "how far the arc sits from the hoop, the dump prints the measured one" })
       slider(s2b, { Name = "Reach", Flag = "S3_Win", Default = CFG.S3.Window,
-        Min = 1, Max = 14, Precision = 1, Suffix = " stds",
+        Min = 1, Max = 14, Precision = 1,
         Callback = function(v) CFG.S3.Window = v end,
         Desc = "how far short of the line it will still pull you out" })
       slider(s2b, { Name = "Past The Line", Flag = "S3_Extra", Default = CFG.S3.Extra,
-        Min = 0, Max = 5, Precision = 1, Suffix = " stds",
+        Min = 0, Max = 5, Precision = 1,
         Callback = function(v) CFG.S3.Extra = v end,
         Desc = "margin behind the arc, too small and the server still calls a 2" })
       s3Legit[#s3Legit+1] = slider(s2b, { Name = "Walk Time", Flag = "S3_StepTime",
@@ -8198,7 +8261,7 @@ return function(_Lib, _Core)
         Callback = function(v) CFG.S3.StepTime = v end,
         Desc = "how long it keeps backing out after the press" })
       s3Legit[#s3Legit+1] = slider(s2b, { Name = "Walk Speed", Flag = "S3_Speed",
-        Default = CFG.S3.Speed, Min = 14, Max = 40, Suffix = " stds/s",
+        Default = CFG.S3.Speed, Min = 14, Max = 40,
         Callback = function(v) CFG.S3.Speed = v end,
         Desc = "written to velocity directly, the game itself caps you at 17" })
       for _, el in ipairs(s3Legit) do
@@ -8262,11 +8325,11 @@ return function(_Lib, _Core)
 
       s6:Header({ Name = "When To Dodge" })
       slider(s6, { Name = "Start Within", Flag = "AD_React", Default = CFG.AntiDef.React,
-        Min = 4, Max = 30, Precision = 1, Suffix = " stds",
+        Min = 4, Max = 30, Precision = 1,
         Callback = function(v) CFG.AntiDef.React = v end,
         Desc = "a defender closer than this counts as covering you" })
       slider(s6, { Name = "Stop At", Flag = "AD_StopAt", Default = CFG.AntiDef.StopAt,
-        Min = 6, Max = 40, Precision = 1, Suffix = " stds",
+        Min = 6, Max = 40, Precision = 1,
         Callback = function(v) CFG.AntiDef.StopAt = v end,
         Desc = "this much room is enough, stop trying for more" })
       bool(s6, "Count Stance As Closer",
@@ -8285,17 +8348,17 @@ return function(_Lib, _Core)
         Callback = function(v) CFG.AntiDef.StepTime = v end,
         Desc = "how long you keep walking after the press" })
       adLegit[#adLegit+1] = slider(s6, { Name = "Walk Speed", Flag = "AD_Speed",
-        Default = CFG.AntiDef.Speed, Min = 14, Max = 40, Suffix = " stds/s",
+        Default = CFG.AntiDef.Speed, Min = 14, Max = 40,
         Callback = function(v) CFG.AntiDef.Speed = v end,
         Desc = "written to velocity directly, the game itself caps you at 17" })
 
       adBack[#adBack+1] = slider(s6, { Name = "Jump Back", Flag = "AD_BackTP",
-        Default = CFG.AntiDef.BackTPMax, Min = 3, Max = 25, Precision = 1, Suffix = " stds",
+        Default = CFG.AntiDef.BackTPMax, Min = 3, Max = 25, Precision = 1,
         Callback = function(v) CFG.AntiDef.BackTPMax = v end,
         Desc = "most it will move you in one step, still capped by Stop At" })
 
       adTele[#adTele+1] = slider(s6, { Name = "Jump Distance", Flag = "AD_Shift",
-        Default = CFG.AntiDef.MaxShift, Min = 3, Max = 20, Suffix = " stds",
+        Default = CFG.AntiDef.MaxShift, Min = 3, Max = 20,
         Callback = function(v) CFG.AntiDef.MaxShift = v end,
         Desc = "how far sideways the faked position may sit" })
 
@@ -8310,9 +8373,14 @@ return function(_Lib, _Core)
         Callback = function(v) if type(v) == "string" then CFG.AntiDef.DribbleCombo = v end end,
       }, ctx.flag("AD_DribCombo"))
       s6:SubLabel({ Text = "X step back | XX snatch back | Z C crossover | H switch hand" })
+      slider(s6, { Name = "Trigger Within", Flag = "AD_DribRange",
+        Default = CFG.AntiDef.DribbleRange, Min = 2, Max = 20, Precision = 1,
+        Callback = function(v) CFG.AntiDef.DribbleRange = v end,
+        Desc = "its own range, Start Within is for the pre-shot step and is much wider" })
       slider(s6, { Name = "Cooldown", Flag = "AD_DribCD", Default = CFG.AntiDef.DribbleCD,
         Min = 0.3, Max = 4.0, Precision = 1, Suffix = " s",
-        Callback = function(v) CFG.AntiDef.DribbleCD = v end })
+        Callback = function(v) CFG.AntiDef.DribbleCD = v end,
+        Desc = "the boost from a move lasts 1.5 s and it locks your movement while it runs" })
 
       function adShow(mode)
         local function put(list, on)
@@ -8334,7 +8402,7 @@ return function(_Lib, _Core)
         function() return CFG.AntiDef.PushOn end,
         function(v) CFG.AntiDef.PushOn = v end, "AD_PushOn")
       slider(s6, { Name = "Push Within", Flag = "AD_Keep", Default = CFG.AntiDef.Keep,
-        Min = 3, Max = 22, Precision = 1, Suffix = " stds",
+        Min = 3, Max = 22, Precision = 1,
         Callback = function(v) CFG.AntiDef.Keep = v end,
         Desc = "closer than this your course bends away, except near the hoop" })
       slider(s6, { Name = "Push Strength", Flag = "AD_Push", Default = CFG.AntiDef.Push,
@@ -8434,7 +8502,9 @@ return function(_Lib, _Core)
         get = function() return CFG.Defense.Enabled end,
         set = function(v)
           CFG.Defense.Enabled = v
-          if v then installMoveHook() else stopSteer("defense"); holdRelease() end
+          -- moveEngineOn, а не installMoveHook: ползунок скорости защиты
+          -- пишет в MovementVelocity, а это уже хук скорости.
+          if v then moveEngineOn() else stopSteer("defense"); holdRelease() end
         end
       })
       s1:Dropdown({
@@ -8450,52 +8520,57 @@ return function(_Lib, _Core)
       }, ctx.flag("DEF_FaceMode"))
       s1:SubLabel({ Text = "who you turn toward while guarding, also used by Auto Move" })
       slider(s1, { Name = "Turn Speed", Flag = "DEF_FaceRate", Default = CFG.Face.Rate,
-        Min = 2, Max = 25, Precision = 1, Suffix = " rad/s",
+        Min = 2, Max = 25, Precision = 1,
         Callback = function(v) CFG.Face.Rate = v end })
       slider(s1, { Name = "Turn Smoothing", Flag = "DEF_FaceSmooth", Default = CFG.Face.Smooth,
         Min = 0.05, Max = 1, Precision = 2,
         Callback = function(v) CFG.Face.Smooth = v end })
       slider(s1, { Name = "Walk Around Him", Flag = "DEF_Around", Default = CFG.Defense.WalkAround,
-        Min = 0, Max = 8, Precision = 1, Suffix = " stds",
+        Min = 0, Max = 8, Precision = 1,
         Callback = function(v) CFG.Defense.WalkAround = v end,
         Desc = "the guard spot sits behind him, 0 walks straight into his body" })
       bool(s1, "Defensive Stance", "hold G while guarding",
         function() return CFG.Defense.HoldG end,
         function(v) CFG.Defense.HoldG = v end)
       slider(s1, { Name = "Hoop Radius", Flag = "DEF_HoopRad", Default = CFG.Defense.HoopRad,
-        Min = 0, Max = 80, Suffix = " stds",
+        Min = 0, Max = 80,
         Callback = function(v) CFG.Defense.HoopRad = v end })
       slider(s1, { Name = "Engage Radius", Flag = "DEF_Engage", Default = CFG.Defense.Engage,
-        Min = 6, Max = 40, Precision = 1, Suffix = " stds",
+        Min = 6, Max = 40, Precision = 1,
         Callback = function(v) CFG.Defense.Engage = v end })
       slider(s1, { Name = "Reaction", Flag = "DEF_Speed", Default = CFG.Defense.Speed,
         Min = 5, Max = 35,
-        Callback = function(v) CFG.Defense.Speed = v end })
+        Callback = function(v) CFG.Defense.Speed = v end,
+        Desc = "how fast the steering direction turns, not how fast you run" })
+      slider(s1, { Name = "Move Speed", Flag = "DEF_MoveSpeed", Default = CFG.Defense.MoveSpeed,
+        Min = 0, Max = 45,
+        Callback = function(v) CFG.Defense.MoveSpeed = v; if v > 0 then moveEngineOn() end end,
+        Desc = "0 leaves it to the game, which caps you at 14 plus 3.35 sprinting" })
       slider(s1, { Name = "Standoff", Flag = "DEF_StandBase", Default = CFG.Defense.StandBase,
-        Min = 2, Max = 12, Suffix = " stds",
+        Min = 2, Max = 12,
         Callback = function(v) CFG.Defense.StandBase = v end })
       slider(s1, { Name = "Standoff On Shot", Flag = "DEF_StandShoot", Default = CFG.Defense.StandShoot,
-        Min = 1, Max = 10, Precision = 1, Suffix = " stds",
+        Min = 1, Max = 10, Precision = 1,
         Callback = function(v) CFG.Defense.StandShoot = v end })
       slider(s1, { Name = "Back Off On Drives", Flag = "DEF_LeadFwd", Default = CFG.Defense.LeadFwd,
         Min = 0, Max = 0.4, Precision = 2, Suffix = " s",
         Callback = function(v) CFG.Defense.LeadFwd = v end,
         Desc = "extra standoff while he charges the rim, measured along the line" })
       slider(s1, { Name = "Lead Cap", Flag = "DEF_LeadMax", Default = CFG.Defense.LeadMax,
-        Min = 0, Max = 8, Precision = 1, Suffix = " stds",
+        Min = 0, Max = 8, Precision = 1,
         Callback = function(v) CFG.Defense.LeadMax = v end,
         Desc = "how far ahead of him the spot may be predicted, 0 stands on him exactly" })
 
       local s2 = T:Section({ Side = "Right" })
       s2:Header({ Name = "Auto Defense · Blow-By" })
       slider(s2, { Name = "Trigger Speed", Flag = "DEF_BlowbySpeed", Default = CFG.Defense.BlowbySpeed,
-        Min = 5, Max = 20, Suffix = " stds/s",
+        Min = 5, Max = 20,
         Callback = function(v) CFG.Defense.BlowbySpeed = v end })
       slider(s2, { Name = "Cut Ahead", Flag = "DEF_BlowbyAhead", Default = CFG.Defense.BlowbyAhead,
-        Min = 2, Max = 14, Precision = 1, Suffix = " stds",
+        Min = 2, Max = 14, Precision = 1,
         Callback = function(v) CFG.Defense.BlowbyAhead = v end })
       slider(s2, { Name = "Sprint From", Flag = "DEF_SprintDist", Default = CFG.Defense.SprintDist,
-        Min = 1, Max = 12, Precision = 1, Suffix = " stds",
+        Min = 1, Max = 12, Precision = 1,
         Callback = function(v) CFG.Defense.SprintDist = v end })
 
       local s3 = T:Section({ Side = "Left" })
@@ -8505,7 +8580,7 @@ return function(_Lib, _Core)
         set = function(v) CFG.Grab.Enabled = v; if not v then stopSteer("grab") end end
       })
       slider(s3, { Name = "Hoop Radius", Flag = "GRAB_HoopRad", Default = CFG.Grab.HoopRad,
-        Min = 0, Max = 60, Suffix = " stds",
+        Min = 0, Max = 60,
         Callback = function(v) CFG.Grab.HoopRad = v end })
       slider(s3, { Name = "Enemy Prediction", Flag = "GRAB_Lead", Default = CFG.Grab.LeadTime,
         Min = 0, Max = 0.5, Precision = 2, Suffix = " s",
@@ -8527,7 +8602,7 @@ return function(_Lib, _Core)
         function() return CFG.Grab.PreCatch end,
         function(v) CFG.Grab.PreCatch = v end)
       slider(s3, { Name = "Max Chase", Flag = "GRAB_MaxRun", Default = CFG.Grab.CatchMaxRun,
-        Min = 0, Max = 60, Suffix = " stds",
+        Min = 0, Max = 60,
         Callback = function(v) CFG.Grab.CatchMaxRun = v end,
         Desc = "farther than this it leaves your movement alone" })
       slider(s3, { Name = "Catch Lead", Flag = "GRAB_CatchLead", Default = CFG.Grab.CatchLead,
@@ -8541,7 +8616,7 @@ return function(_Lib, _Core)
         function() return CFG.Grab.RimGuard end,
         function(v) CFG.Grab.RimGuard = v end)
       slider(s3, { Name = "Vertical Reach", Flag = "GRAB_ReachSet", Default = 0,
-        Min = 0, Max = 32, Suffix = " stds",
+        Min = 0, Max = 32,
         Callback = function(v) CFG.Grab.ReachSet = v end,
         Desc = "0 = measured. raise if the script ignores balls near the rim" })
       slider(s3, { Name = "Jump Earlier", Flag = "GRAB_JumpEarly", Default = CFG.Grab.JumpEarly,
@@ -8549,13 +8624,13 @@ return function(_Lib, _Core)
         Callback = function(v) CFG.Grab.JumpEarly = v end,
         Desc = "every missed catch in the log jumped late, hits jumped early" })
       slider(s3, { Name = "Rim Guard Reach", Flag = "GRAB_ReachXZ", Default = CFG.Grab.ReachXZ,
-        Min = 2, Max = 14, Suffix = " stds",
+        Min = 2, Max = 14,
         Callback = function(v) CFG.Grab.ReachXZ = v end })
       slider(s3, { Name = "Bait Guard", Flag = "GRAB_MinCommit", Default = CFG.Grab.MinCommit,
         Min = 0, Max = 0.4, Precision = 2, Suffix = " s",
         Callback = function(v) CFG.Grab.MinCommit = v end })
       slider(s3, { Name = "Camp Radius", Flag = "GRAB_CampRad", Default = CFG.Grab.CampRad,
-        Min = 0, Max = 40, Suffix = " stds",
+        Min = 0, Max = 40,
         Callback = function(v) CFG.Grab.CampRad = v end })
 
       s3:Divider()
@@ -8596,7 +8671,7 @@ return function(_Lib, _Core)
       })
       s4:SubLabel({ Text = "step into the shooter and hold the stance instead of chasing the ball" })
       slider(s4, { Name = "Gap", Flag = "BL_Gap", Default = CFG.Blatant.Gap,
-        Min = 0.5, Max = 6, Precision = 1, Suffix = " stds",
+        Min = 0.5, Max = 6, Precision = 1,
         Callback = function(v) CFG.Blatant.Gap = v end })
       slider(s4, { Name = "Stance Time", Flag = "BL_Stance", Default = CFG.Blatant.StanceTime,
         Min = 0.1, Max = 2.0, Precision = 2, Suffix = " s",
@@ -8607,7 +8682,7 @@ return function(_Lib, _Core)
         Callback = function(v) CFG.Blatant.HoldTime = v end,
         Desc = "how long the FAKED POSITION is held, separate from the stance" })
       slider(s4, { Name = "Dunk Rise", Flag = "BL_DunkRise", Default = CFG.Blatant.DunkRise,
-        Min = 0, Max = 8, Precision = 1, Suffix = " stds",
+        Min = 0, Max = 8, Precision = 1,
         Callback = function(v) CFG.Blatant.DunkRise = v end,
         Desc = "extra height when he goes up for a dunk or layup" })
       slider(s4, { Name = "Meter Trigger", Flag = "BL_Meter", Default = CFG.Blatant.MeterTrigger,
@@ -8615,7 +8690,7 @@ return function(_Lib, _Core)
         Callback = function(v) CFG.Blatant.MeterTrigger = v end,
         Desc = "step in at this much of his shot meter, 0 waits for the release" })
       slider(s4, { Name = "Hoop Radius", Flag = "BL_HoopRad", Default = CFG.Blatant.HoopRad,
-        Min = 8, Max = 60, Suffix = " stds",
+        Min = 8, Max = 60,
         Callback = function(v) CFG.Blatant.HoopRad = v end,
         Desc = "ignore shooters farther than this from our hoop" })
       bool(s4, "Engage On Windup", "step in on the gather, the shot packet is already half a ping late",
@@ -8629,7 +8704,7 @@ return function(_Lib, _Core)
         Callback = function(v) CFG.Blatant.JumpWindow = v end,
         Desc = "keeps re-sending the jump until the server confirms you left the floor" })
       slider(s4, { Name = "Call It A Dunk Within", Flag = "BL_RimGuess",
-        Default = CFG.Blatant.RimGuess, Min = 0, Max = 20, Precision = 1, Suffix = " stds",
+        Default = CFG.Blatant.RimGuess, Min = 0, Max = 20, Precision = 1,
         Callback = function(v) CFG.Blatant.RimGuess = v end,
         Desc = "a gather this close to the rim ends in a dunk, jump now instead of waiting" })
 
@@ -8646,7 +8721,7 @@ return function(_Lib, _Core)
         set = function(v) CFG.Move.Speed.Enabled = v; mv(v) end
       })
       slider(s1, { Name = "Speed", Flag = "MV_SpeedVal", Default = CFG.Move.Speed.Value,
-        Min = 14, Max = 60, Suffix = " stds/s",
+        Min = 14, Max = 60,
         Callback = function(v) CFG.Move.Speed.Value = v end })
 
       local s15 = T:Section({ Side = "Right" })
@@ -8660,7 +8735,7 @@ return function(_Lib, _Core)
         function() return CFG.Move.GhostFoes.All end,
         function(v) CFG.Move.GhostFoes.All = v end, "MV_GhostAll")
       slider(s15, { Name = "Radius", Flag = "MV_GhostRad", Default = CFG.Move.GhostFoes.Radius,
-        Min = 8, Max = 60, Suffix = " stds",
+        Min = 8, Max = 60,
         Callback = function(v) CFG.Move.GhostFoes.Radius = v end })
 
       s15:SubLabel({ Text = "Drops their part collision, your own state is untouched" })
@@ -8679,7 +8754,7 @@ return function(_Lib, _Core)
       }, ctx.flag("MV_SlipMode"))
       s13:SubLabel({ Text = "Default dodges one man | Feint reads him and cuts back" })
       slider(s13, { Name = "Rim Free Zone", Flag = "MV_RimFree", Default = CFG.Move.RimFree,
-        Min = 0, Max = 30, Suffix = " stds",
+        Min = 0, Max = 30,
         Callback = function(v) CFG.Move.RimFree = v end,
         Desc = "no course bending this close to the hoop, so drives stay dunks" })
       slider(s13, { Name = "Start Distance", Flag = "MV_SlipStart", Default = CFG.Move.Slip.StartMul,
@@ -8691,27 +8766,27 @@ return function(_Lib, _Core)
         function() return CFG.Move.Slip.SkipNoContact end,
         function(v) CFG.Move.Slip.SkipNoContact = v end, "MV_SlipSkip")
       slider(s13, { Name = "Slip Angle", Flag = "MV_SlipAngle", Default = CFG.Move.Slip.Angle,
-        Min = 9, Max = 40, Suffix = " deg",
+        Min = 9, Max = 40,
         Callback = function(v) CFG.Move.Slip.Angle = v end,
         Desc = "below 9 the game cancels your run instead of letting you past" })
       slider(s13, { Name = "Turn Off Him", Flag = "MV_SlipLookDeg", Default = CFG.Move.Slip.LookDeg,
-        Min = 0, Max = 80, Suffix = " deg",
+        Min = 0, Max = 80,
         Callback = function(v) CFG.Move.Slip.LookDeg = v end,
         Desc = "eyes off the man in stance, facing him is what invites the push" })
       slider(s13, { Name = "Stance Range", Flag = "MV_StanceRange", Default = CFG.Move.Slip.StanceRange,
-        Min = 6, Max = 24, Precision = 1, Suffix = " stds",
+        Min = 6, Max = 24, Precision = 1,
         Callback = function(v) CFG.Move.Slip.StanceRange = v end,
         Desc = "a man in stance this close makes it start looking for space" })
       slider(s13, { Name = "Keep Away", Flag = "MV_SlipKeep", Default = CFG.Move.Slip.KeepGap,
-        Min = 4, Max = 24, Precision = 1, Suffix = " stds",
+        Min = 4, Max = 24, Precision = 1,
         Callback = function(v) CFG.Move.Slip.KeepGap = v end,
         Desc = "same trigger for anyone not in stance" })
       slider(s13, { Name = "Open Enough", Flag = "MV_Open", Default = CFG.Move.Slip.Open,
-        Min = 6, Max = 30, Suffix = " stds",
+        Min = 6, Max = 30,
         Callback = function(v) CFG.Move.Slip.Open = v end,
         Desc = "past this he no longer contests, so no reason to run further" })
       slider(s13, { Name = "Step Out", Flag = "MV_StepOut", Default = CFG.Move.Slip.StepOut,
-        Min = 5, Max = 22, Suffix = " stds",
+        Min = 5, Max = 22,
         Callback = function(v) CFG.Move.Slip.StepOut = v end,
         Desc = "how far ahead the candidate spots sit" })
       slider(s13, { Name = "Follow Input", Flag = "MV_InputW", Default = CFG.Move.Slip.InputWeight,
@@ -8719,7 +8794,7 @@ return function(_Lib, _Core)
         Callback = function(v) CFG.Move.Slip.InputWeight = v end,
         Desc = "0 goes purely for space, high keeps your own direction" })
       slider(s13, { Name = "Max Turn", Flag = "MV_MaxTurn", Default = CFG.Move.Slip.MaxTurn,
-        Min = 15, Max = 85, Suffix = " deg",
+        Min = 15, Max = 85,
         Callback = function(v) CFG.Move.Slip.MaxTurn = v end,
         Desc = "hard cap on how far it may bend you off your own keys" })
       slider(s13, { Name = "Commit", Flag = "MV_FeintCommit", Default = CFG.Move.Slip.CommitTime,
@@ -8730,11 +8805,11 @@ return function(_Lib, _Core)
         function() return CFG.Move.Slip.LookFake end,
         function(v) CFG.Move.Slip.LookFake = v end, "MV_LookFake")
       slider(s13, { Name = "Look Angle", Flag = "MV_LookOff", Default = CFG.Move.Slip.LookOff,
-        Min = 0, Max = 70, Suffix = " deg",
+        Min = 0, Max = 70,
         Callback = function(v) CFG.Move.Slip.LookOff = v end,
         Desc = "past 41 the game starts cutting speed unless Strafer is on" })
       slider(s13, { Name = "Zone Radius", Flag = "MV_ZoneRad", Default = CFG.Move.Slip.ZoneRad,
-        Min = 8, Max = 45, Suffix = " stds",
+        Min = 8, Max = 45,
         Callback = function(v) CFG.Move.Slip.ZoneRad = v end,
         Desc = "further than this from the rim it stops feinting entirely" })
 
@@ -8746,7 +8821,7 @@ return function(_Lib, _Core)
         Desc = "WASD, Space up, LeftShift down"
       })
       slider(s2, { Name = "Fly Speed", Flag = "MV_FlyVal", Default = CFG.Move.Fly.Speed,
-        Min = 10, Max = 200, Suffix = " stds/s",
+        Min = 10, Max = 200,
         Callback = function(v) CFG.Move.Fly.Speed = v end })
 
       local s14 = T:Section({ Side = "Right" })
@@ -9018,10 +9093,10 @@ return function(_Lib, _Core)
       local s2 = T:Section({ Side = "Right" })
       s2:Header({ Name = "Ball Detection" })
       slider(s2, { Name = "Min Speed", Flag = "MS_MinSpeed", Default = CFG.Traj.MinSpeed,
-        Min = 1, Max = 30, Suffix = " stds/s",
+        Min = 1, Max = 30,
         Callback = function(v) CFG.Traj.MinSpeed = v end })
       slider(s2, { Name = "Hold Distance", Flag = "MS_HoldDist", Default = CFG.Traj.HoldDist,
-        Min = 3, Max = 14, Suffix = " stds",
+        Min = 3, Max = 14,
         Callback = function(v) CFG.Traj.HoldDist = v end })
       slider(s2, { Name = "Ball Poll", Flag = "MS_TagEvery", Default = CFG.Traj.TagEvery,
         Min = 0.05, Max = 1.0, Precision = 2, Suffix = " s",
@@ -9040,8 +9115,11 @@ return function(_Lib, _Core)
         set = function(v) CFG.Vis.Zones = v end,
         Desc = "draws on the floor the range each feature actually works in"
       })
-      s3:SubLabel({ Text = "only rings of features you have switched on are drawn" })
-      s3:SubLabel({ Text = "orange Distance Spoof | blue Smart 3PT | pink Contact Slip" })
+      s3:SubLabel({ Text = "a ring appears only while its own feature is switched on" })
+      slider(s3, { Name = "Height Above Floor", Flag = "VZ_Lift", Default = CFG.Vis.Lift,
+        Min = 0, Max = 3, Precision = 2,
+        Callback = function(v) CFG.Vis.Lift = v end,
+        Desc = "the floor itself is found by a ray under your feet, this only nudges it" })
       slider(s3, { Name = "Smoothness", Flag = "VZ_Seg", Default = CFG.Vis.Segments,
         Min = 8, Max = 64,
         Callback = function(v) CFG.Vis.Segments = v end,
@@ -9053,15 +9131,44 @@ return function(_Lib, _Core)
         function() return CFG.Vis.Labels end,
         function(v) CFG.Vis.Labels = v end, "VZ_Labels")
 
+      s3:Divider()
+      s3:Header({ Name = "Which Zones" })
+      local function zone(title, key, desc)
+        bool(s3, title, desc,
+          function() return CFG.Vis.Show[key] end,
+          function(v) CFG.Vis.Show[key] = v end, "VZ_S_" .. key)
+        s3:Colorpicker({ Name = title .. " Color", Default = CFG.Vis.Col[key],
+          Callback = function(c) CFG.Vis.Col[key] = c end }, ctx.flag("VZ_C_" .. key))
+      end
+      zone("Distance Spoof", "Spoof", "where the swap turns on, and where it stands you")
+      zone("Smart 3PT", "S3", "the line it aims past, and how far short it still reaches")
+      zone("Contact Slip", "Slip", "how close a defender gets before it steers you")
+      zone("Rim Free Zone", "RimFree", "inside this your course is never bent")
+      zone("Auto Defense", "Defend", "the line from him to your hoop, and the spot you take")
+      zone("Intercept Point", "Catch", "where the script expects to meet the ball")
+
       local s4 = T:Section({ Side = "Right" })
       feature(s4, {
         Title = "Script Path", Flag = "VZ_Path",
         get = function() return CFG.Vis.Path end,
         set = function(v) CFG.Vis.Path = v end,
-        Desc = "arrows to the spot the script is walking you to, and why"
+        Desc = "a walkway to the spot the script is taking you to, and why"
       })
-      s4:SubLabel({ Text = "green intercept | blue auto move | yellow defense | red anti defense" })
-      s4:SubLabel({ Text = "the arrows fade out on their own once nothing is steering you" })
+      s4:SubLabel({ Text = "two rails with sliding rungs, a ring and a mast on the target" })
+      bool(s4, "Color By Owner",
+        "intercept, defense and anti defense each keep their own color",
+        function() return CFG.Vis.PathByOwner end,
+        function(v) CFG.Vis.PathByOwner = v end, "VZ_PathOwner")
+      s4:Colorpicker({ Name = "Path Color", Default = CFG.Vis.Col.Path,
+        Callback = function(c) CFG.Vis.Col.Path = c end }, ctx.flag("VZ_C_Path"))
+      s4:SubLabel({ Text = "used when Color By Owner is off" })
+      slider(s4, { Name = "Width", Flag = "VZ_PathW", Default = CFG.Vis.PathWidth,
+        Min = 0.4, Max = 4, Precision = 1,
+        Callback = function(v) CFG.Vis.PathWidth = v end })
+      bool(s4, "Sliding Rungs", "the crossbars run forward, so direction reads at a glance",
+        function() return CFG.Vis.PathFlow end,
+        function(v) CFG.Vis.PathFlow = v end, "VZ_PathFlow")
+      s4:SubLabel({ Text = "it fades out on its own once nothing is steering you" })
     end
 
     do
@@ -9088,48 +9195,11 @@ return function(_Lib, _Core)
         function(v) CFG.Grab.FaceBall = v end, "MS_FaceBall")
 
       slider(s4, { Name = "Turn Rate", Flag = "MS_TurnRate", Default = CFG.Grab.CatchFaceRate,
-        Min = 2, Max = 60, Precision = 1, Suffix = " rad/s",
+        Min = 2, Max = 60, Precision = 1,
         Callback = function(v) CFG.Grab.CatchFaceRate = v end })
       slider(s4, { Name = "Jump Cooldown", Flag = "MS_JumpCD", Default = CFG.Grab.JumpCD,
         Min = 0.1, Max = 1.5, Precision = 2, Suffix = " s",
         Callback = function(v) CFG.Grab.JumpCD = v end })
-
-      local s5 = T:Section({ Side = "Left" })
-      feature(s5, {
-        Title = "Fling", Flag = "MS_Fling",
-        get = function() return CFG.Fling.Enabled end,
-        set = function(v)
-          CFG.Fling.Enabled = v
-          if not v then PBX.flingStop("switched off") end
-        end,
-        Desc = "throws the nearest player with a physics desync on the proxy body"
-      })
-      s5:Dropdown({
-        Name = "Method", Options = { "Velocity", "Spin", "Teleport" },
-        Default = CFG.Fling.Method, Required = true,
-        Callback = function(v) if type(v) == "string" then CFG.Fling.Method = v end end,
-      }, ctx.flag("MS_FlingMethod"))
-      s5:SubLabel({ Text = "three of them because the engine blocks these one at a time" })
-      s5:SubLabel({ Text = "it pulls you onto him, then puts you back where you were" })
-      slider(s5, { Name = "Power", Flag = "MS_FlingPower", Default = CFG.Fling.Power,
-        Min = 1000, Max = 400000,
-        Callback = function(v) CFG.Fling.Power = v end,
-        Desc = "velocity magnitude written each frame, higher is not always better" })
-      slider(s5, { Name = "Radius", Flag = "MS_FlingRad", Default = CFG.Fling.Radius,
-        Min = 4, Max = 40, Suffix = " stds",
-        Callback = function(v) CFG.Fling.Radius = v end,
-        Desc = "nobody inside this and it simply waits" })
-      slider(s5, { Name = "Burst", Flag = "MS_FlingDur", Default = CFG.Fling.Duration,
-        Min = 0.2, Max = 4.0, Precision = 2, Suffix = " s",
-        Callback = function(v) CFG.Fling.Duration = v end,
-        Desc = "one burst, then a short pause, repeating while this is on" })
-      bool(s5, "Opponents Only", "otherwise it grabs the nearest player of any team",
-        function() return CFG.Fling.Foes end,
-        function(v) CFG.Fling.Foes = v end, "MS_FlingFoes")
-      bool(s5, "Boost Simulation Radius",
-        "without it the engine often will not hand you his physics at all",
-        function() return CFG.Fling.SimBoost end,
-        function(v) CFG.Fling.SimBoost = v end, "MS_FlingSim")
     end
 
     do
