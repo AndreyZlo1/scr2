@@ -1,4 +1,4 @@
---[[ PRACTICAL BASKETBALL v148 — Potassium/UNC — модуль для лоадера Syllinse ]]
+--[[ PRACTICAL BASKETBALL v150 — Potassium/UNC — модуль для лоадера Syllinse ]]
 
 -- Luraph macro prelude. Installed through STRING KEYS on the global env so a
 -- bare macro token never appears in real code (that would abort Luraph). Raw,
@@ -20,7 +20,7 @@ do
   end
 end
 
-local VERSION = 148
+local VERSION = 150
 
 local CFG = {
 
@@ -141,6 +141,10 @@ local CFG = {
 
     MaxSpeed   = 150,
 
+    -- Радиус вокруг наших колец, внутри которого мяч считается «нашим», пока
+     -- матчевый мяч не опознан напрямую через Court.Game.Attributes.Basketball.
+    CourtRad   = 70,
+
     MapCheck   = true,
     Bounces    = 3,
     BounceKeep = 0.55,
@@ -179,6 +183,17 @@ local CFG = {
     Catch        = true,
 
     SkipMakes    = true,
+    -- МЁРТВЫЙ МЯЧ: ЗАБИЛИ, ФОЛ, ВЫХОД ЗА ПРЕДЕЛЫ.
+    -- Пару секунд после этого мяч лежит или его несут на вбрасывание, и
+    -- взять его нельзя в принципе. Скрипт в это время просто бегал.
+    SkipDead     = true,
+    -- Сколько держим паузу после засчитанного попадания. Признака «мяч
+    -- мёртв» в клиенте игры нет, решение целиком серверное, поэтому попадание
+    -- мы определяем сами по дуге и отсчитываем окно от него.
+    DeadAfterScore = 2.6,
+    -- Дольше этого паузу не держим ни при каких признаках: предохранитель
+    -- на случай серверного атрибута, который завис поднятым.
+    DeadMax      = 8.0,
 
     PreCatch     = true,
     PreArcTail   = 1.6,
@@ -198,7 +213,10 @@ local CFG = {
     -- дампе 2396 отказов "no reachable catch point" уложились в 1.20..1.48:
     -- то есть мы вставали ровно на границе. Оценка консервативна, мяч
     -- отскакивает, а по расстоянию нас всё равно ограничивает CatchMaxRun.
-    CatchChase   = 2.50,
+    -- Снова упёрлись в потолок: в дампе v148 отказ "no reachable catch point"
+    -- набрал 894 срабатывания, и ВСЕ они уложились в 2.50..2.55 — то есть
+    -- ровно на границе. По расстоянию нас всё равно держит CatchMaxRun.
+    CatchChase   = 3.00,
     -- ДАЛЬШЕ ЭТОГО ЗА МЯЧОМ НЕ БЕЖИМ ВООБЩЕ.
     -- CatchChase меряет нехватку ВРЕМЕНИ и на далёком мяче легко проходит,
     -- из-за чего скрипт перехватывал управление ради заведомо безнадёжной
@@ -324,6 +342,10 @@ local CFG = {
     -- СКОЛЬКО ВРЕМЕНИ ДОБИВАЕМСЯ ПРЫЖКА. Один пакет Jump может не дойти или
     -- прийти в Debounce; повторяем, пока сервер не поднимет InAir.
     JumpWindow = 0.45,
+    -- Дальше этого прыгать на чужой данк бессмысленно: накрыть всё равно не
+    -- достанем, а Jump Cooldown потратим. MaxDist = 120 годится для выхода на
+    -- позицию, но не для прыжка.
+    JumpRange = 10,
     DunkRise  = 3.0,   -- добавка к высоте, когда он идёт данком или лэйапом
     Cooldown = 0.30,
     -- ПОРОГ ПО МЕТРУ ВРАГА. Раньше вход был только по Action = rim/windup, а
@@ -393,6 +415,9 @@ local CFG = {
     -- Разгонный данк без скорости не выбирается, и сервер отдаёт лэйап.
     -- Внутри этого радиуса от кольца курс не трогаем вообще.
     RimFree    = 14,
+    -- Запас перед щитом: ближе этого к линии «за кольцом» точка считается
+    -- заходом за щит и отбрасывается всеми подвижными фичами сразу.
+    BehindPad  = 2.0,
     Slip = {
       Enabled = false,
       Angle   = 18,
@@ -512,7 +537,13 @@ local CFG = {
     PreShot   = true,
     Mode      = "Legit",
     Dribble     = false,
-    DribbleCombo= "X",     -- Dribbling.Input.X = StepBack на обе руки
+    -- НАБОР ХОДОВ, ИЗ КОТОРОГО БЕРЁТСЯ СЛУЧАЙНЫЙ.
+    -- Один и тот же ход подряд читается соперником мгновенно, да и игра на
+    -- повтор отвечает одинаково. Dribbling_ModuleScript.Input сопоставляет
+    -- комбинации ходам: X это StepBack, XX это SnatchBack, Z и C кроссовер и
+    -- хезитация, H смена руки, ZX и CX за спину, ZXC и CXZ разворот.
+    DribbleCombo= "X",     -- запасной ход, если из списка ничего не выбрано
+    DribbleSet  = { X = true },
     -- Ускорение от хода живёт 1.5 с (Base:140/:144), а сам ход на это время
     -- отбирает управление движением. Чаще слать нечего и вредно.
     DribbleCD   = 2.0,
@@ -537,6 +568,9 @@ local CFG = {
     -- смысл в том, чтобы сбить угол защитнику, а не убежать в угол площадки.
     SideMax   = 35,
     HoopCost  = 0.5,   -- цена каждого лишнего студа от кольца при выборе
+    -- Премия за уход вбок в студах разрыва. Нужна потому, что с одним
+    -- защитником максимум разрыва всегда даёт строго «прямо назад».
+    SideBonus = 1.5,
 
     BoostFrames = 3,
     StanceWeight = 2.0,
@@ -557,6 +591,8 @@ local CFG = {
     MaxRun   = 1.10,
 
     HoldTol  = 3.0,
+    -- Ближе этого до точки спринт снимаем, чтобы не проскочить её.
+    SprintOff = 2.0,
 
     Stance   = false,
     StanceRad= 6.0,
@@ -1235,6 +1271,78 @@ function PBX.passToCached(ball)
   P.f, P.ball, P.rcv = HUB.frame, ball, PBX.passTo(ball)
   return P.rcv
 end
+-- ИГРОК ИЗ НАШЕГО МАТЧА.
+-- Когда ростер известен (Court.Game.Attributes.Players), он и есть истина.
+-- Без ростера в парке ориентируемся на номер площадки: соседний матч нас
+-- не касается.
+function PBX.inSameMatch(c)
+  if not c then return false end
+  if PK.side then return PK.names[c.Name] ~= nil end
+  local mine = sAttr(chr(), "CourtNumber")
+  if mine == nil then return true end
+  return sAttr(c, "CourtNumber") == mine
+end
+
+-- МЯЧ, КОТОРЫЙ СЕЙЧАС НЕЛЬЗЯ ВЗЯТЬ.
+-- Прямого признака в клиенте игры нет: разрешение на подбор выдаёт сервер,
+-- и ни атрибута на мяче, ни поля на площадке в дампе не нашлось (искал по
+-- всему клиенту: Court.Inbounding только читается, PickupDebounce нигде не
+-- используется). Зато однозначно читаются СОСТОЯНИЯ ИГРОКОВ, и каждое из них
+-- означает остановку игры:
+--   Inbounding  — мяч вводят из-за боковой, Base:261 обрабатывает это
+--                 действие отдельно, а GameUtil:70 держит его в core action
+--   Celebration и AwaitingCelebration — только что забили
+--   FreeThrow, WatchingFreeThrow      — штрафные
+--   Fouled                            — свисток
+-- Плюс собственное наблюдение: заходящий бросок мы видим по дуге сами
+-- (по нему уже работает Skip Makes). После него держим паузу — это и есть
+-- те самые «пару секунд», пока мяч лежит под кольцом.
+PBX.DEAD_ACT = { Inbounding = true, Celebration = true,
+                 AwaitingCelebration = true }
+PBX.dead = { at = -1, v = false, why = nil, since = nil }
+function PBX.ballDead()
+  local D = PBX.dead
+  local now = os.clock()
+  -- Состояние игры не меняется быстрее десяти раз в секунду, а обход всех
+  -- персонажей с чтением пяти атрибутов каждый кадр — это лишний расход.
+  if (now - D.at) < 0.1 then return D.v, D.why end
+  D.at, D.v, D.why = now, false, nil
+
+  local w = CFG.Grab.DeadAfterScore
+  if w > 0 and HUB.scoredAt and (now - HUB.scoredAt) < w then
+    D.v, D.why = true, ("the ball just went in, %.1f s left"):format(w - (now - HUB.scoredAt))
+    return D.v, D.why
+  end
+  for _, c in ipairs(charsList()) do
+    if PBX.inSameMatch(c) then
+      local a = sAttr(c, "Action")
+      if a ~= nil and PBX.DEAD_ACT[a] == true then
+        D.v, D.why = true, ("%s is %s"):format(c.Name, tostring(a))
+        break
+      end
+      if sAttr(c, "Inbounding") == true or sAttr(c, "Fouled") == true
+         or sAttr(c, "FreeThrow") == true or sAttr(c, "WatchingFreeThrow") == true then
+        D.v, D.why = true, ("whistle on %s"):format(c.Name)
+        break
+      end
+    end
+  end
+  -- ПРЕДОХРАНИТЕЛЬ НА ЗАЛИПШИЙ АТРИБУТ.
+  -- Читаем чужие состояния, а какое из них сервер может оставить поднятым
+  -- надолго — проверить неоткуда. Если пауза тянется дольше разумного,
+  -- считаем игру живой: лучше лишний забег, чем выключенный перехват.
+  if D.v then
+    D.since = D.since or now
+    if (now - D.since) > (CFG.Grab.DeadMax or 8) then
+      D.v, D.why = false, nil
+      HUB.deadStuck = (HUB.deadStuck or 0) + 1
+    end
+  else
+    D.since = nil
+  end
+  return D.v, D.why
+end
+
 function PBX.passTo(ball)
   if not ball then return nil end
   for _, c in ipairs(charsList()) do
@@ -1527,6 +1635,39 @@ local function defendGoalPos(shooter)
   return HUB.defendCache
 end
 
+-- ЗА КОЛЬЦО НЕ ХОДИМ И НЕ ТЕЛЕПОРТИРУЕМСЯ.
+-- Любая точка по ТУ сторону щита бесполезна: бросать оттуда некуда, пас не
+-- отдать, а вернуться стоит целой секунды. Направление «в поле» берём от
+-- кольца ко ВТОРОМУ кольцу — это ось площадки. На площадке с одним кольцом
+-- (в парке такие есть, в дампе hoopCount = 1) второго нет, и тогда берём
+-- направление от кольца к нам самим: мы заведомо стоим на поле.
+function PBX.behindHoop(q, fromPos)
+  local list = PBX.hoops and PBX.hoops() or nil
+  if not list or #list == 0 then return false end
+  local hp, hd = nil, nil
+  for _, p in ipairs(list) do
+    local d = ((q - p) * FLAT).Magnitude
+    if not hd or d < hd then hp, hd = p, d end
+  end
+  if not hp then return false end
+  local inward = nil
+  if #list >= 2 then
+    for _, p in ipairs(list) do
+      if p ~= hp then
+        local v = (p - hp) * FLAT
+        if v.Magnitude > 1 then inward = v.Unit; break end
+      end
+    end
+  end
+  if not inward and fromPos then
+    local v = (fromPos - hp) * FLAT
+    if v.Magnitude > 1 then inward = v.Unit end
+  end
+  if not inward then return false end
+  return ((q - hp) * FLAT):Dot(inward) < (CFG.Move.BehindPad or 0)
+end
+
+PBX.hoops = hoopList
 local function nearestHoop(from)
   local best, bd
   for _, p in ipairs(hoopList()) do
@@ -1731,6 +1872,31 @@ local function scheduleRelease(g, t0, startArgs, isRetry)
   end
   HUB.lastArmSawMeter = sawMeter
   HUB.lastSrvStartLag = tSrvStart and (tSrvStart - t0) or nil
+
+  -- СЕРВЕР БРОСОК НЕ НАЧАЛ — ЖДАТЬ НЕЧЕГО, И ЭТО ТА САМАЯ «ЗАДЕРЖКА».
+  -- Ни взвода метра, ни разу Action не стал броском, ShotStartTime не
+  -- сдвинулся. Раньше мы всё равно шли в основной цикл и досиживали там до
+  -- clockTarget: в дампе это запись с firedBy = "clock_nometer", samples = 0
+  -- и hold = 0.80 с — восемь десятых секунды, которые игрок просто стоит.
+  -- Выходим сразу и НИЧЕГО не отправляем: отпускать нечего.
+  if not (armed or sawShooting or tSrvStart) then
+    HUB.shotNoStart = (HUB.shotNoStart or 0) + 1
+    HUB.deadWhy = "server never started the shot"
+    if HUB.pendingGen == g then PBX.pendClear() end
+    zeroRelease()
+    if HUB.shotPressAt and startArgs and not isRetry and CFG.Enabled then
+      HUB.gen += 1
+      local g2 = HUB.gen
+      PBX.pendHold(g2)
+      HUB.shotRetry = (HUB.shotRetry or 0) + 1
+      HUB.bypass = true
+      pcall(Mt.FireServer, R.Shoot, startArgs)
+      HUB.bypass = false
+      HUB.shotSentGen = g2
+      task.spawn(scheduleRelease, g2, os.clock(), startArgs, true)
+    end
+    return
+  end
 
   if dead then
     HUB.shotDead = (HUB.shotDead or 0) + 1
@@ -2097,7 +2263,8 @@ function PBX.antiDir(hp, dir, want, realPos)
       local nd = Vector3.new(dir.X*co - dir.Z*si, 0, dir.X*si + dir.Z*co)
       local np = hp + nd*want
 
-      if ((np - here) * FLAT).Magnitude <= CFG.AntiDef.MaxShift then
+      if ((np - here) * FLAT).Magnitude <= CFG.AntiDef.MaxShift
+         and not PBX.behindHoop(np, hp + dir*want) then
         local d = nearestFrom(np)
         if d > bestD then best, bestD = nd, d end
       end
@@ -2273,6 +2440,14 @@ local function spoofShot(g, startArgs)
 
   if not useFake and not moved then return plain() end
   local fake = hp + dir*want + Vector3.new(0, realCF.Position.Y-hp.Y, 0)
+  -- ПОДМЕНА ТОЖЕ НЕ ДОЛЖНА СТАВИТЬ НАС ЗА ЩИТ.
+  -- Направление радиальное от кольца, поэтому обычно всё в порядке, но
+  -- отклонение в PBX.antiDir доходит до восьмидесяти градусов, а на близкой
+  -- дистанции этого хватает, чтобы обойти кольцо кругом.
+  if PBX.behindHoop(fake, realCF.Position) then
+    HUB.spoofWhy = "swap refused: the faked spot lands behind the hoop"
+    return plain()
+  end
 
   local fakeCF = lookAtCF(fake, hp, pc)
   if not fakeCF then return plain() end
@@ -2565,11 +2740,20 @@ local updateBall = LPH_NO_VIRTUALIZE(function()
    if mine then
      okCourt = (b == mine)
    elseif hoopsMine and #hoopsMine > 0 then
+     -- МЯЧ НЕ НАШЕЙ ИГРЫ ГОНЯТЬ НЕЧЕГО.
+     -- Запас в 150 студов затягивал в выборку мячи соседних площадок парка и
+     -- просто лежащие вне игры: в дампе tagged = 5 при matchBall = false, и
+     -- отсюда 22633 срабатывания "rim catch closing". Сужаем до радиуса, на
+     -- котором мяч физически может нас касаться, и требуем, чтобы матч шёл.
      okCourt = false
-     local bp = posOf(b)
-     if bp then
-       for _, hp in ipairs(hoopsMine) do
-         if ((bp - hp) * FLAT).Magnitude <= 150 then okCourt = true; break end
+     if (not CFG.Grab.OnlyInMatch) or PBX.matchLive() then
+       local bp = posOf(b)
+       if bp then
+         for _, hp in ipairs(hoopsMine) do
+           if ((bp - hp) * FLAT).Magnitude <= CFG.Traj.CourtRad then
+             okCourt = true; break
+           end
+         end
        end
      end
    end
@@ -2753,7 +2937,32 @@ local updateBall = LPH_NO_VIRTUALIZE(function()
 
     BALL.stale = (BALL.stale or 0) + (now - (BALL.lastTick or now))
   else
-    BALL.state, BALL.holder, BALL.speed = "idle", nil, 0
+    -- ПОПАДАНИЕ ЗАСЕКАЕМ ЗДЕСЬ: дуга говорила «заходит», и полёт кончился.
+    -- Это единственный момент, где мы можем узнать про гол своими силами.
+    -- Берём вердикт ИЗ САМОЙ ДУГИ этого полёта, а не глобальный hitsStable:
+    -- тот остаётся от прошлого владения и на коротком полёте дал бы ложный гол.
+    if BALL.state == "flight" and HUB.arc and HUB.arc.hits == true
+       and HUB.arc.ball == BALL.part and (now - (BALL.tFlight or 0)) > 0.3 then
+      HUB.scoredAt = now
+      HUB.scoredN = (HUB.scoredN or 0) + 1
+    end
+    -- МЯЧ ОСТАНОВИЛСЯ, НО ОН ВСЁ ЕЩЁ ГДЕ-ТО ЛЕЖИТ.
+    -- Раньше при потере скорости состояние уходило в idle, а BALL.pos
+    -- оставался с ПОСЛЕДНЕГО кадра полёта. Ветка подбора у кольца читает
+    -- BALL.pos независимо от состояния — и мы бежали к точке, где мяча уже
+    -- нет. Обновляем позицию, гасим скорость и раз в десятую секунды
+    -- выясняем, не подобрал ли его кто-то: иначе гнались бы и за держателем.
+    local rp = BALL.part and posOf(BALL.part) or nil
+    if rp then
+      BALL.pos, BALL.vel = rp, Vector3.new()
+      if (now - (BALL.restAt or 0)) > 0.1 then
+        BALL.restAt = now
+        BALL.holder = holderOf(rp)
+      end
+    else
+      BALL.holder = nil
+    end
+    BALL.state, BALL.speed = "idle", 0
   end
   BALL.lastTick = now
 
@@ -2875,6 +3084,9 @@ function PBX.groundUnder(pos)
     local bb = sChild(Workspace, "Basketballs"); if bb then list[#list+1] = bb end
     if pc then list[#list+1] = pc end
     PBX.gndRP.FilterDescendantsInstances = list
+    -- Ищем НАСТОЯЩУЮ опору, а не декоративную деталь или невидимый триггер:
+    -- иначе «пол» окажется выше площадки и дуга оборвётся в воздухе.
+    pcall(function() PBX.gndRP.RespectCanCollide = true end)
     PBX.gndProxy = pc
   end
   local ok, hit = pcall(function()
@@ -2914,9 +3126,15 @@ PBX.march = LPH_NO_VIRTUALIZE(function(p0, v0, dur, n, ball)
   if type(floorY) ~= "number" then floorY = nil end
   -- Мяч это шар, и его ЦЕНТР останавливается не на полу, а на радиусе выше.
   if floorY then floorY = floorY + CFG.Traj.FloorPad end
-  -- Если мяч почему-то уже ниже найденного пола (например пол определился по
-  -- трибуне над нами), низ не трогаем вовсе: иначе оборвём дугу на первом шаге.
-  local useFloor = floorY ~= nil and p0.Y > floorY + 0.2
+  -- ПОЛ НЕ ОТКЛЮЧАЕМ НИКОГДА — ИМЕННО ЭТО И ОСТАВЛЯЛО ДЫРУ.
+  -- Раньше при p0.Y <= floorY + 0.2 нижняя граница выключалась целиком, «чтобы
+  -- не оборвать дугу на первом шаге». Но именно так выглядит мяч, который
+  -- ОТСКОЧИЛ и висит у самой площадки: старт почти на уровне пола, скорость
+  -- вертикальная вниз — и дуга уходила сквозь землю. Правильно не выключать,
+  -- а опустить границу под сам мяч: ниже той точки, где он уже есть, дуга
+  -- всё равно уйти не может.
+  local useFloor = floorY ~= nil
+  if useFloor and p0.Y <= floorY + 0.05 then floorY = p0.Y - 0.05 end
   local cp, cv, t = p0, v0, 0
   arc.p0, arc.v0 = p0, v0
   arc[1] = { t = 0, p = cp }
@@ -4509,6 +4727,25 @@ end
 -- после отшага мы дальше ВСЕХ соперников сразу, а не только ближайшего, и
 -- где не уехали к лицевой: угол на кольцо дороже лишнего студа разрыва.
 -- Барьеры площадки проверяем тем же лучом, что и обход в Contact Slip.
+-- СЛУЧАЙНЫЙ ХОД ИЗ ВЫБРАННЫХ.
+-- Список пересобираем только когда набор менялся: выбор идёт из кадрового
+-- тика, и строить таблицу заново ради одного элемента — лишний мусор.
+function PBX.pickDribble()
+  local A = CFG.AntiDef
+  if PBX.dribDirty or not PBX.dribList then
+    local list = {}
+    for k, on in pairs(A.DribbleSet or {}) do
+      if on and type(k) == "string" and k ~= "" then list[#list+1] = k end
+    end
+    table.sort(list)
+    PBX.dribList, PBX.dribDirty = list, false
+  end
+  local list = PBX.dribList
+  if #list == 0 then return A.DribbleCombo end
+  if #list == 1 then return list[1] end
+  return list[math.random(1, #list)]
+end
+
 function PBX.legitDir(mp, base, hp)
   local A = CFG.AntiDef
   local maxA = math.rad(A.SideMax or 0)
@@ -4532,8 +4769,16 @@ function PBX.legitDir(mp, base, hp)
       sc = sc - math.max(dh - dh0, 0) * (A.HoopCost or 0)
     end
     if SLIP.pastBarrier(mp, q) then sc = sc - 1e6 end
+    if PBX.behindHoop(q, mp) then sc = sc - 1e6 end
     return sc
   end
+  -- НЕБОЛЬШАЯ ПРЕМИЯ ЗА УХОД ВБОК.
+  -- С одним защитником максимум разрыва всегда даёт «прямо от него», поэтому
+  -- перебор честно выбирал ноль градусов — в дампе antiSide = 0 при разрешённых
+  -- семидесяти. Но прямо назад он просто пятится следом, сохраняя угол, а на
+  -- боковой уход ему приходится заново вставать на линию. Премия маленькая:
+  -- она решает только там, где разрыв практически одинаков.
+  local bonus = A.SideBonus or 0
   local best, bs = base, score(base)
   for i = 1, 3 do
     for _, sgn in ipairs({ 1, -1 }) do
@@ -4541,7 +4786,7 @@ function PBX.legitDir(mp, base, hp)
       local ca, sa = math.cos(ang), math.sin(ang)
       local d = Vector3.new(base.X*ca - base.Z*sa, 0, base.X*sa + base.Z*ca)
       if d.Magnitude > 1e-3 then
-        local s = score(d.Unit)
+        local s = score(d.Unit) + bonus * math.abs(math.sin(ang))
         if s > bs then best, bs = d.Unit, s end
       end
     end
@@ -4614,6 +4859,15 @@ function PBX.legitStep(g, hp)
       local away = (startPos - foe0) * FLAT
       away = (away.Magnitude > 0.1) and away.Unit or Vector3.new(0,0,1)
       local want = math.min(A.StopAt - gap0, A.BackTPMax)
+      -- НЕ ПРЫГАТЬ ЗА ЩИТ И НЕ ЗА БОРТИК.
+      -- away смотрит просто от защитника. Если он стоит между нами и полем,
+      -- этот вектор ведёт ПРЯМО за кольцо: оттуда ни бросить, ни вернуться.
+      -- Укорачиваем прыжок, пока точка не станет законной, шагами по студу.
+      while want > 0 do
+        local q = startPos + away * want
+        if not PBX.behindHoop(q, startPos) and not SLIP.pastBarrier(startPos, q) then break end
+        want = want - 1
+      end
       if want > 0 then
         local okc, cf = pcall(RDR.CFrame, pc)
         if okc and cf then
@@ -4622,6 +4876,8 @@ function PBX.legitStep(g, hp)
           HUB.antiShot = ("back teleport: gap %.1f -> %.1f (%.1f stds)")
             :format(gap0, gap0 + want, want)
         end
+      else
+        HUB.antiShot = "back teleport refused: only spot left is behind the hoop"
       end
     end
     if moved == 0 then HUB.antiShot = "back teleport blocked (server holds the position)" end
@@ -4647,6 +4903,11 @@ function PBX.legitStep(g, hp)
     -- каждом кадре заставлял бы шарахаться из стороны в сторону.
     if not pickDir then pickDir = PBX.legitDir(mp, dir, hp) end
     dir = pickDir
+    -- Шаг за щит не делаем даже если разрыв там больше.
+    if PBX.behindHoop(mp + dir * 3, mp) then
+      HUB.antiWhy = "stopped, the only way back is behind the hoop"
+      break
+    end
     -- Подмену позиции глушим только пока реально идём: tpProxy стёр бы уход.
     HUB.antiStepUntil = os.clock() + 0.05
     HUB.antiDir = dir
@@ -4739,12 +5000,14 @@ track(RunService.Heartbeat:Connect(function()
   HUB.antiDribAt = os.clock()
   local sprint = false
   pcall(function() sprint = UIS:IsKeyDown(Enum.KeyCode.LeftShift) end)
+  local combo = PBX.pickDribble()
   HUB.bypass = true
-  local ok = pcall(Mt.FireServer, R.Drib, A.DribbleCombo, sprint, dir)
+  local ok = pcall(Mt.FireServer, R.Drib, combo, sprint, dir)
   HUB.bypass = false
   HUB.antiDribN = (HUB.antiDribN or 0) + 1
+  HUB.antiDribLast = combo
   HUB.antiDrib = ok
-    and ("%s fired at %.1f stds (x%d)"):format(tostring(A.DribbleCombo), best, HUB.antiDribN)
+    and ("%s fired at %.1f (x%d)"):format(tostring(combo), best, HUB.antiDribN)
     or "the Dribble remote refused"
 end))
 
@@ -4775,6 +5038,7 @@ function PBX.s3Step(g, hp, need)
     got = away.Magnitude
     if got >= need then break end
     away = (got > 0.1) and away.Unit or Vector3.new(0, 0, 1)
+    if PBX.behindHoop(mp + away * 3, mp) then break end
     -- Тот же флаг «мы реально идём»: пока он поднят, подмена позиции в
     -- spoofShot не вызывает tpProxy и не стирает уход.
     HUB.antiStepUntil = os.clock() + 0.05
@@ -5052,6 +5316,31 @@ function PBX.preCatchSpot()
   return nil, "rebound point not reachable"
 end
 
+-- ТОЧКА ПОСЛЕ ОТСКОКА ОТ ДУЖКИ.
+-- Промах по кольцу почти всегда даёт отскок назад, и стоять под щитом в
+-- момент удара бессмысленно: мяч уйдёт мимо, а мы поедем за ним второй раз.
+-- Ищем первую точку дуги ПОСЛЕ контакта, до которой дотягиваемся и по
+-- высоте, и по времени, — туда и идём сразу.
+function PBX.reboundSpot(arc, me)
+  if not (arc and me) then return nil end
+  local firstHit = nil
+  for i, sp in ipairs(arc) do
+    if sp.hit then firstHit = i; break end
+  end
+  if not firstHit then return nil end
+  local reach, speed = JP.reachY(), math.max(ourSpeed(), 1)
+  for i = firstHit + 1, #arc do
+    local sp = arc[i]
+    local dy = sp.p.Y - me.Y
+    if dy >= -2 and dy <= reach then
+      local run = ((sp.p - me) * FLAT).Magnitude
+      local need = math.max(run - CFG.Grab.CatchBody, 0) / speed
+      if need <= sp.t then return sp.p, sp.t end
+    end
+  end
+  return nil
+end
+
 local function bestBlockSpot(arc, tMax, hoop)
   local ground = groundLevel()
   local me = selfPos()
@@ -5245,6 +5534,15 @@ local function threatBudget(carrier)
       fitN = CFG.Grab.GuardFitN
     })
     if not hi then return nil, nil end
+    -- БРОСОК НЕ ЗАХОДИТ — ИДЁМ СРАЗУ НА ОТСКОК, А НЕ ПОД ЩИТ.
+    -- bestBlockSpot ищет точку, БЛИЖАЙШУЮ К КОЛЬЦУ: для накрытия это верно,
+    -- для подбора нет. На промахе он приводил нас к дужке, а мяч в этот
+    -- момент уже летел обратно, и приходилось ехать второй раз.
+    if HUB.arc.hits == false then
+      local rp, rt = PBX.reboundSpot(HUB.arc.arc, selfPos())
+      if rp then HUB.autoRebound = true; return rt, rp end
+    end
+    HUB.autoRebound = false
     local bp, bt = bestBlockSpot(HUB.arc.arc, nil, hoopWeDefend())
     if bp then return bt, bp end
     local sp = HUB.arc.arc[hi]
@@ -5323,6 +5621,13 @@ track(RunService.Heartbeat:Connect(function(dt)
   end
   if PBX.ballIsOurs() then
     HUB.autoWhy = "the ball is ours"; stopSteer("automove"); return
+  end
+  if CFG.Grab.SkipDead then
+    local dead, why = PBX.ballDead()
+    if dead then
+      HUB.autoWhy = "dead ball: " .. tostring(why)
+      stopSteerSoft("automove"); return
+    end
   end
 
   if HUB.moveOwner and HUB.moveOwner ~= "automove" then return end
@@ -5406,7 +5711,11 @@ track(RunService.Heartbeat:Connect(function(dt)
     stopSteerSoft("automove")
   else
     local dir = ((spot - me) * FLAT).Unit
-    steerToDir(dir, M2.Sprint and (d > 6) or false, "automove")
+    -- СПРИНТ ДЕРЖИМ ПОЧТИ ДО САМОЙ ТОЧКИ.
+    -- Порог стоял на шести студах, и последний отрезок мы шли шагом: при
+    -- потолке ходьбы 14 против 17.35 со спринтом это лишние 0.15 с на ровном
+    -- месте, а по ощущению — «замедляется, когда уже почти дошёл».
+    steerToDir(dir, M2.Sprint and (d > M2.SprintOff) or false, "automove")
   end
 
   if carrier then
@@ -5545,6 +5854,12 @@ local function rimGuardTick(dt)
 
   if not (info and info.arc) then PBX.gs("no ball in flight"); return false end
   PBX.gs("ball in flight")
+  -- ДУГА ВЕДОМОГО МЯЧА НЕ ЗНАЧИТ НИЧЕГО.
+  -- Пока мяч у кого-то в руках, подгонка описывает дриббл, а не полёт. По
+  -- этому дампу: средняя ошибка предсказания на 0.3 с вперёд 5.86 студа по
+  -- всем мячам против 2.82 у свободного. Прыгать по такой дуге — гадать, и
+  -- в журнале это записи с traj err 10.5 и 6.3 при промахе.
+  if BALL.holder ~= nil then PBX.gs("ball is held, arc is dribble noise"); return false end
 
   local hi, _, _, why = pickInterceptPoint(info, {
     skipOwn   = CFG.Grab.SkipOwn,
@@ -5586,6 +5901,17 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
   if PBX.ballIsOurs() then
     HUB.blockWhy = "the ball is ours"; stopSteer("grab"); return
   end
+  -- ЗА МЁРТВЫМ МЯЧОМ НЕ БЕГАЕМ.
+  -- Один гейт на весь тик: он закрывает и охрану кольца, и подбор, и хват.
+  if CFG.Grab.SkipDead then
+    local dead, why = PBX.ballDead()
+    if dead then
+      HUB.blockWhy = "dead ball: " .. tostring(why)
+      HUB.deadBallWhy = why
+      stopSteer("grab"); return
+    end
+  end
+  HUB.deadBallWhy = nil
   -- ПОКА CONTEST SHOOTER ДЕРЖИТ ПОДМЕНУ ПОЗИЦИИ — ПЕРЕХВАТ МОЛЧИТ.
   -- Он считает всё от нашей позиции, а во время телепорта она подменена: тик
   -- видит «мяч вдруг рядом», начинает вести и прыгать, и одновременно с этим
@@ -6627,6 +6953,37 @@ track(RunService.Heartbeat:Connect(function(dt)
     BL.state = "idle"; HUB.blatantHolding = false; HUB.blatantWhy = "we have the ball"; return
   end
 
+  -- ПРЫЖОК НА ДАНК АРМИТСЯ РАНЬШЕ ВСЕГО ОСТАЛЬНОГО. ЭТО И ЕСТЬ «НЕ УСПЕВАЕТ».
+  -- Раньше он ставился ТОЛЬКО внутри contestEngage, а туда ведёт длинная
+  -- дорога: состояние обязано быть idle, кулдаун обязан пройти, обязан
+  -- найтись ProxyCharacter, и обязан пройти physAllowed — то есть сервер не
+  -- должен был двигать нас последние 0.35 с. Любая из этих проверок не
+  -- прошла — и прыжка нет вовсе, хотя сам прыжок ни от одной из них не
+  -- зависит: это просто пакет Jump. При замеренном лаге прыжка 0.40 с и окне
+  -- лэйапа около 1.3 с (видно в slipLog: ContactLayup держится 1.35 с)
+  -- каждый потерянный кадр решает. Ставим намерение сразу по действию.
+  if R.Jump and not BL.jumpUntil and sAttr(chr(), "InAir") ~= true then
+    local me0 = selfPos()
+    local hp0 = me0 and hoopWeDefend() or nil
+    if me0 and hp0 then
+      local pool, np = foeSnap()
+      for i = 1, np do
+        local e = pool[i]
+        if PBX.SHOT_RIM[e.act] == true
+           and ((e.p - hp0) * FLAT).Magnitude <= B.HoopRad
+           and ((e.p - me0) * FLAT).Magnitude <= B.JumpRange then
+          BL.wasRim, BL.wantJump = true, true
+          BL.jumpN, BL.jumpAt = 0, 0
+          BL.jumpUntil = os.clock() + B.JumpWindow
+          HUB.blatantRimSeen = (HUB.blatantRimSeen or 0) + 1
+          HUB.blatantWhy = ("rim attack by %s, jumping now")
+            :format(e.c and e.c.Name or "?")
+          break
+        end
+      end
+    end
+  end
+
   if BL.state == "hold" then
     local tgt = BL.target
     if not (tgt and tgt.Parent) then
@@ -6887,7 +7244,8 @@ local function save()
     ballIsPass = BALL.isPass, ballHoldAct = BALL.holdAct,
     blatantSkipCD = HUB.blatantSkipCD, ghostSelfHealed = HUB.ghostSelfHealed,
     blatantBackPending = (BL and BL.backCF ~= nil) or nil,
-    antiDribN = HUB.antiDribN, antiDribMove = CFG.AntiDef.DribbleCombo,
+    antiDribN = HUB.antiDribN, antiDribMove = HUB.antiDribLast,
+    antiDribSet = CFG.AntiDef.DribbleSet,
     antiPushOn = CFG.AntiDef.PushOn,
     s3Mode = CFG.S3.Mode, s3Walk = HUB.s3Walk,
     hideSprint = CFG.Zero.HideSprint, sprintHidden = HUB.sprintHidden,
@@ -6940,6 +7298,9 @@ local function save()
     scoreDist = HUB.scoreDist, scoreRad = CFG.Traj.ScoreRad,
     arcBounces = HUB.arc and HUB.arc.arc and HUB.arc.arc.bounces or nil,
     skipMakes = CFG.Grab.SkipMakes, preCatch = CFG.Grab.PreCatch,
+    skipDead = CFG.Grab.SkipDead, deadWait = CFG.Grab.DeadAfterScore,
+    deadBallWhy = HUB.deadBallWhy, scoredN = HUB.scoredN,
+    scoredAgo = HUB.scoredAt and (os.clock() - HUB.scoredAt) or nil,
     antiTest = HUB.antiTest,
 
     slipFoes = HUB.slipFoes, slipZone = HUB.slipZone,
@@ -7127,11 +7488,17 @@ local function save()
   rep(("[PB] shots: server never started %d, re-pressed %d | spoof: %s")
     :format(HUB.shotNoStart or 0, HUB.shotRetry or 0,
             tostring(HUB.spoofWhy or "applied or not needed")))
+  do
+    local dead, why = PBX.ballDead()
+    rep(("[PB] dead ball: skip=%s | right now: %s | scores seen %d")
+      :format(tostring(CFG.Grab.SkipDead),
+              dead and tostring(why) or "ball is live", HUB.scoredN or 0))
+  end
   rep(("[PB] ball nature: last holder action %s | treated as a pass: %s")
     :format(tostring(BALL.holdAct or "-"), tostring(BALL.isPass)))
   rep(("[PB] anti defense: push=%s | dribble=%s (%s) | %s")
     :format(tostring(CFG.AntiDef.PushOn), tostring(CFG.AntiDef.Dribble),
-            tostring(CFG.AntiDef.DribbleCombo), tostring(HUB.antiDrib or "-")))
+            tostring(HUB.antiDribLast or "-"), tostring(HUB.antiDrib or "-")))
   rep(("[PB] sprint: hidden=%s swallowed=%d | player wants sprint=%s")
     :format(tostring(CFG.Zero.HideSprint), HUB.sprintHidden or 0,
             tostring(HUB.wantSprint)))
@@ -7646,18 +8013,13 @@ track(RunService.Heartbeat:Connect(function()
   local now = os.clock()
   local rescan = (now - (HUB.ghostScanAt or 0)) > 1.0
   if rescan then HUB.ghostScanAt = now end
-  -- Самолечение: если атрибут у нас всё-таки снят (старой сборкой или
-  -- гонкой на перерождении), возвращаем его. По умолчанию он true, и
-  -- игра нигде его не переписывает.
-  if rescan then
-    pcall(function()
-      local me = chr()
-      if me and me:GetAttribute("CanCollide") == false then
-        me:SetAttribute("CanCollide", true)
-        HUB.ghostSelfHealed = (HUB.ghostSelfHealed or 0) + 1
-      end
-    end)
-  end
+  -- САМОЛЕЧЕНИЕ УБРАНО, И ЭТО ВАЖНО.
+  -- Я возвращал свой CanCollide в true, считая, что снял его сам. Проверка
+  -- по всему дампу игры: клиент этот атрибут только ЧИТАЕТ (Collision:114),
+  -- не пишет нигде. Значит его ставит СЕРВЕР — под свои состояния. А счётчик
+  -- в прошлом дампе показал 29 срабатываний, то есть я двадцать девять раз
+  -- перебил серверное состояние своим. Ровно такие расхождения и вешали
+  -- персонажа раньше. Свой атрибут не трогаем ни в какую сторону.
   -- Врезаться можно только в того, кто РЯДОМ. Список уже отфильтрован по
   -- 140 студам, но для коллизии и это далеко: держим свой, маленький радиус,
   -- иначе в парке каждый кадр перебираются десятки лишних персонажей.
@@ -8379,11 +8741,30 @@ return function(_Lib, _Core)
         function() return CFG.AntiDef.Dribble end,
         function(v) CFG.AntiDef.Dribble = v end, "AD_Drib")
       s6:Dropdown({
-        Name = "Move", Options = { "X", "XX", "Z", "C", "H" },
-        Default = CFG.AntiDef.DribbleCombo, Required = true,
-        Callback = function(v) if type(v) == "string" then CFG.AntiDef.DribbleCombo = v end end,
+        Name = "Moves", Options = { "X", "XX", "Z", "C", "H", "ZX", "CX", "ZXC", "CXZ" },
+        Default = { "X" }, Multi = true,
+        Callback = function(v)
+          -- Мульти-дропдаун MacLib отдаёт таблицу, и форма у неё зависит от
+          -- версии: где-то это { X = true }, где-то { "X", "Z" }. Разбираем
+          -- обе, иначе набор молча окажется пустым.
+          local set = {}
+          if type(v) == "table" then
+            for k, val in pairs(v) do
+              if type(k) == "string" then
+                if val then set[k] = true end
+              elseif type(val) == "string" then
+                set[val] = true
+              end
+            end
+          elseif type(v) == "string" then
+            set[v] = true
+          end
+          CFG.AntiDef.DribbleSet = set
+          PBX.dribDirty = true
+        end,
       }, ctx.flag("AD_DribCombo"))
-      s6:SubLabel({ Text = "X step back | XX snatch back | Z C crossover | H switch hand" })
+      s6:SubLabel({ Text = "pick several, one is drawn at random each time" })
+      s6:SubLabel({ Text = "X step back | XX snatch | Z C crossover | H hand | ZX CX behind | ZXC spin" })
       slider(s6, { Name = "Trigger Within", Flag = "AD_DribRange",
         Default = CFG.AntiDef.DribbleRange, Min = 2, Max = 20, Precision = 1,
         Callback = function(v) CFG.AntiDef.DribbleRange = v end,
@@ -8609,6 +8990,14 @@ return function(_Lib, _Core)
       bool(s3, "Skip Makes", "ignore shots that go clean in, wait for the miss",
         function() return CFG.Grab.SkipMakes end,
         function(v) CFG.Grab.SkipMakes = v end)
+      bool(s3, "Skip Dead Ball",
+        "after a score, a foul or a whistle the ball cannot be taken at all",
+        function() return CFG.Grab.SkipDead end,
+        function(v) CFG.Grab.SkipDead = v end, "GRAB_SkipDead")
+      slider(s3, { Name = "Dead Ball Wait", Flag = "GRAB_DeadWait",
+        Default = CFG.Grab.DeadAfterScore, Min = 0, Max = 6, Precision = 1, Suffix = " s",
+        Callback = function(v) CFG.Grab.DeadAfterScore = v end,
+        Desc = "how long the ball stays untouchable after it goes in" })
       bool(s3, "Early Rebound", "start moving on shot start, before the ball leaves his hands",
         function() return CFG.Grab.PreCatch end,
         function(v) CFG.Grab.PreCatch = v end)
@@ -8714,6 +9103,10 @@ return function(_Lib, _Core)
         Min = 0.1, Max = 1.2, Precision = 2, Suffix = " s",
         Callback = function(v) CFG.Blatant.JumpWindow = v end,
         Desc = "keeps re-sending the jump until the server confirms you left the floor" })
+      slider(s4, { Name = "Jump Range", Flag = "BL_JumpRange", Default = CFG.Blatant.JumpRange,
+        Min = 3, Max = 30, Precision = 1,
+        Callback = function(v) CFG.Blatant.JumpRange = v end,
+        Desc = "only jump at a dunk this close, further away it just burns the cooldown" })
 
     end
 
@@ -8747,7 +9140,7 @@ return function(_Lib, _Core)
 
       s15:SubLabel({ Text = "Drops their part collision, your own state is untouched" })
 
-      local s2 = T:Section({ Side = "Right" })
+      local s2 = T:Section({ Side = "Left" })
       feature(s2, {
         Title = "Fly", Flag = "MV_Fly",
         get = function() return CFG.Move.Fly.Enabled end,
@@ -8758,7 +9151,7 @@ return function(_Lib, _Core)
         Min = 10, Max = 200,
         Callback = function(v) CFG.Move.Fly.Speed = v end })
 
-      local s14 = T:Section({ Side = "Right" })
+      local s14 = T:Section({ Side = "Left" })
       feature(s14, {
         Title = "NoClip", Flag = "MV_NoClip",
         get = function() return CFG.Move.NoClip.Enabled end,
