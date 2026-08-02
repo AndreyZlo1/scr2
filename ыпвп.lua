@@ -1,4 +1,4 @@
---[[ PRACTICAL BASKETBALL v143 — Potassium/UNC — модуль для лоадера Syllinse ]]
+--[[ PRACTICAL BASKETBALL v144 — Potassium/UNC — модуль для лоадера Syllinse ]]
 
 -- Luraph macro prelude. Installed through STRING KEYS on the global env so a
 -- bare macro token never appears in real code (that would abort Luraph). Raw,
@@ -20,7 +20,7 @@ do
   end
 end
 
-local VERSION = 143
+local VERSION = 144
 
 local CFG = {
 
@@ -177,7 +177,11 @@ local CFG = {
     CatchStand   = 1.5,
     CatchBody    = 3.5,
 
-    CatchChase   = 1.20,
+    -- Насколько НЕ ХВАТАЕТ времени, но мы всё равно бежим. Было 1.20, и в
+    -- дампе 2396 отказов "no reachable catch point" уложились в 1.20..1.48:
+    -- то есть мы вставали ровно на границе. Оценка консервативна, мяч
+    -- отскакивает, а по расстоянию нас всё равно ограничивает CatchMaxRun.
+    CatchChase   = 2.50,
     -- ДАЛЬШЕ ЭТОГО ЗА МЯЧОМ НЕ БЕЖИМ ВООБЩЕ.
     -- CatchChase меряет нехватку ВРЕМЕНИ и на далёком мяче легко проходит,
     -- из-за чего скрипт перехватывал управление ради заведомо безнадёжной
@@ -289,6 +293,12 @@ local CFG = {
     -- Отсюда «долго удерживает». Контест начисляется на регистрации броска,
     -- пары кадров достаточно.
     HoldTime  = 0.12,
+    -- СТОЙКА ДЕРЖИТСЯ ДОЛЬШЕ ПОДМЕНЫ ПОЗИЦИИ, И ЭТО РАЗНЫЕ ВЕЩИ.
+    -- HoldTime — сколько кадров держим подменённую позицию, её надо
+    -- показать серверу на регистрации и сразу убрать. Стойка же работает
+    -- всё время, пока соперник целится: контест копится, пока защитник
+    -- рядом и в стойке. Держать её те же 0.12 с бессмысленно.
+    StanceTime = 0.80,
     DunkRise  = 3.0,   -- добавка к высоте, когда он идёт данком или лэйапом
     Cooldown = 0.30,
     -- ПОРОГ ПО МЕТРУ ВРАГА. Раньше вход был только по Action = rim/windup, а
@@ -450,6 +460,7 @@ local CFG = {
     Keep    = 7.0,     -- защитник ближе этого подмешивается в твой курс
     Push    = 0.70,    -- насколько сильно подмешивается
     OnlyBall= true,
+    PushOn  = false,   -- постоянный увод: отдельный выключатель
     Stance  = true,
 
     PreShot   = true,
@@ -1142,7 +1153,10 @@ PBX.SHOT_WIND = { Gathering = true, ContactPlant = true }
 -- можно идти напрямую, и гнуть курс не только незачем — вредно: увод стоит
 -- скорости и роняет forwardValue.
 PBX.NO_CONTACT = { Dunking = true, ContactLayup = true, CatchingPass = true,
-                   Passing = true, Shooting = true }
+                   Passing = true, Shooting = true,
+                   -- Не из списка игры, но по смыслу то же: на проходе и на
+                   -- рывке гнуть курс — значит мешать самому себе.
+                   BlowingBy = true, BlowbyPush = true }
 function PBX.contactOff()
   local a = sAttr(chr(), "Action")
   return a ~= nil and PBX.NO_CONTACT[a] == true
@@ -3582,10 +3596,21 @@ function PBX.moveBody(self, dt, r)
         if typeof(own) ~= "Vector3" or own.Magnitude < 0.1 then ov = nil end
       end
 
-      if CFG.AntiDef.Enabled and not ov and type(self) == "table" then
+      -- ПОСТОЯННЫЙ УВОД ТЕПЕРЬ ВКЛЮЧАЕТСЯ ОТДЕЛЬНО.
+      -- Он висел на общем выключателе Anti Defense: включаешь отшаг перед
+      -- броском — и молча получаешь вечное искривление курса, которое никак
+      -- не отключить. В дампе Contact Slip выключен (slipWhy = "off"), а от
+      -- соперников всё равно уводит — это была именно эта ветка.
+      if CFG.AntiDef.Enabled and CFG.AntiDef.PushOn
+         and not ov and type(self) == "table" then
         local own = rawget(self, "MoveDirection")
-        if typeof(own) == "Vector3" and own.Magnitude > 0.1
-           and not PBX.drivingRim(own) then
+        local skip = PBX.drivingRim(own) or PBX.contactOff()
+        if skip then
+          HUB.antiWhy = PBX.contactOff()
+            and ("no contact during %s, not bending"):format(tostring(sAttr(chr(), "Action")))
+            or "driving the rim, course left alone"
+        end
+        if typeof(own) == "Vector3" and own.Magnitude > 0.1 and not skip then
           local me2 = selfPos()
           if me2 and ((not CFG.AntiDef.OnlyBall) or hasBall(chr())) then
             local foe, fd = nil, nil
@@ -5314,7 +5339,15 @@ track(RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(PBX.guarded("intercept", fu
         local eff = math.max(run - CFG.Grab.CatchBody, 0)
 
         local need = eff / speed
-        if dy > CFG.Grab.ArmReach then need = need + JP.bodyRise(dy) end
+        if dy > CFG.Grab.ArmReach then
+          -- ПОДЪЁМ СТОИТ НЕ ТОЛЬКО ПОЛЁТА ТЕЛА, НО И ЛАГА ПРЫЖКА.
+          -- Прыжок уходит ремоутом на сервер и возвращается: замеренный лаг
+          -- в дампах 0.40..0.51 с. Без него расчёт говорит "успеваем", мы
+          -- добегаем и прыгаем уже мимо — ровно те промахи, где нужен был
+          -- подъём на 1.1..1.4 студа.
+          need = need + JP.bodyRise(dy)
+                      + (HUB.jumpLag or (CFG.Grab.JumpLagFallback * (dataPing() or 0.1)))
+        end
         if need <= sp.t then
 
           if dy <= CFG.Grab.ArmReach then
@@ -5646,8 +5679,13 @@ end
 
 local function blatantRelease()
   BL.gen += 1
-  if BL.heldG and R.HoldG then
+  -- СТОЙКУ ЗДЕСЬ НЕ СНИМАЕМ, ЕСЛИ ЕЁ ВРЕМЯ ЕЩЁ НЕ ВЫШЛО.
+  -- Раньше выход из подмены позиции гасил и стойку, поэтому она жила ровно
+  -- HoldTime = 0.12 с. Контест за это время не набирается. Теперь за стойку
+  -- отвечает BL.gUntil, а снимает её отдельный присмотр ниже.
+  if BL.heldG and R.HoldG and not (BL.gUntil and os.clock() < BL.gUntil) then
     BL.heldG = false
+    BL.gUntil = nil
     HUB.bypass = true
     pcall(Mt.FireServer, R.HoldG, { HoldingG = false })
     HUB.bypass = false
@@ -5745,6 +5783,8 @@ local function contestEngage(c, why, provisional)
   BL.wantG    = (B.HoldG and R.HoldG and not isRim) and true or false
   BL.wantJump = isRim and true or false
   BL.jumped, BL.gSent, BL.gAt = false, 0, 0
+  -- Стойка начинается СЕЙЧАС, в момент обнаружения, и живёт своё время.
+  BL.gUntil = BL.wantG and (os.clock() + B.StanceTime) or nil
 
   -- ФАЛЬШИВЫЙ БРОСОК УБРАН СОВСЕМ.
   -- Он слал Shoot=true, Jump и через 0.12 с Shoot=false мимо нашего же хука.
@@ -5754,6 +5794,31 @@ local function contestEngage(c, why, provisional)
   HUB.blatantWhy = ("engaged %s at %.1f (%s)"):format(c.Name, d, why)
   return true
 end
+
+-- ПРИСМОТР ЗА СТОЙКОЙ, НЕЗАВИСИМО ОТ ПОДМЕНЫ ПОЗИЦИИ.
+-- Подмена длится доли секунды, стойка — своё время. Пока оно идёт, при
+-- необходимости переотправляем; когда вышло — снимаем ровно один раз.
+track(RunService.Heartbeat:Connect(function()
+  if not (HUB.running and BL.gUntil) then return end
+  if os.clock() < BL.gUntil then
+    if R.HoldG and sAttr(chr(), "HoldingG") ~= true
+       and os.clock() - (BL.gAt or 0) > 0.12 then
+      BL.gAt = os.clock()
+      BL.gSent = (BL.gSent or 0) + 1
+      HUB.bypass = true
+      pcall(Mt.FireServer, R.HoldG, { HoldingG = true })
+      HUB.bypass = false
+    end
+    return
+  end
+  BL.gUntil = nil
+  if BL.heldG and R.HoldG then
+    BL.heldG = false
+    HUB.bypass = true
+    pcall(Mt.FireServer, R.HoldG, { HoldingG = false })
+    HUB.bypass = false
+  end
+end))
 
 track(RunService.Heartbeat:Connect(function(dt)
   if not HUB.running then return end
@@ -6674,11 +6739,17 @@ local clipSaved = weakKeys({})
 local foeClipSaved = weakKeys({})
 -- Список деталей на персонажа: дерево обходим редко, флаг ставим часто.
 PBX.ghostCache = weakKeys({})
+-- Кого мы пометили как несталкивающегося: вернуть при выключении.
+local ghostAttr = weakKeys({})
 local function ghostRestore()
   for part, was in pairs(foeClipSaved) do
     pcall(function() if part.Parent then part.CanCollide = was end end)
   end
   table.clear(foeClipSaved)
+  for c in pairs(ghostAttr) do
+    pcall(function() if c.Parent then c:SetAttribute("CanCollide", true) end end)
+  end
+  table.clear(ghostAttr)
 end
 track({ Disconnect = ghostRestore })
 track(RunService.Heartbeat:Connect(function()
@@ -6720,9 +6791,20 @@ track(RunService.Heartbeat:Connect(function()
         end
         PBX.ghostCache[c] = list
       end
-      -- Один pcall на персонажа, а не на каждую деталь: при шести игроках
-      -- это сотня защищённых вызовов в кадр против шести. Запись безопасна,
-      -- пока деталь жива, а Parent как раз это и проверяет.
+      -- ДВА РАЗНЫХ МЕХАНИЗМА СТОЛКНОВЕНИЯ, И СНИМАТЬ НАДО ОБА.
+      -- 1) Физика движка: свойство CanCollide у деталей — это мы делали.
+      -- 2) Collision_ModuleScript:114 ДОПОЛНИТЕЛЬНО расталкивает вручную,
+      --    сдвигая HumanoidRootPart, и гейтится на АТРИБУТЕ CanCollide
+      --    ПЕРСОНАЖА, а не на свойстве деталей. Снятое свойство его не
+      --    останавливало вовсе — отсюда "проходить сквозь так и не даёт".
+      --    Ставим атрибут локально: модуль сразу пропускает этого игрока.
+      --    Свой атрибут по-прежнему НЕ трогаем, он реплицируется и вешает.
+      pcall(function()
+        if c:GetAttribute("CanCollide") ~= false then
+          if ghostAttr[c] == nil then ghostAttr[c] = true end
+          c:SetAttribute("CanCollide", false)
+        end
+      end)
       local okw = pcall(function()
         for i = 1, #list do
           local d = list[i]
@@ -7377,7 +7459,10 @@ return function(_Lib, _Core)
       adShow(CFG.AntiDef.Mode)
 
       s6:Header({ Name = "Constant Push" })
-      s6:SubLabel({ Text = "Runs all the time, not just on shots" })
+      bool(s6, "Enable Constant Push",
+        "bends your own course away from defenders ALL the time, off by default",
+        function() return CFG.AntiDef.PushOn end,
+        function(v) CFG.AntiDef.PushOn = v end, "AD_PushOn")
       slider(s6, { Name = "Push Within", Flag = "AD_Keep", Default = CFG.AntiDef.Keep,
         Min = 3, Max = 22, Precision = 1, Suffix = " stds",
         Callback = function(v) CFG.AntiDef.Keep = v end,
@@ -7621,10 +7706,14 @@ return function(_Lib, _Core)
       slider(s4, { Name = "Gap", Flag = "BL_Gap", Default = CFG.Blatant.Gap,
         Min = 0.5, Max = 6, Precision = 1, Suffix = " stds",
         Callback = function(v) CFG.Blatant.Gap = v end })
+      slider(s4, { Name = "Stance Time", Flag = "BL_Stance", Default = CFG.Blatant.StanceTime,
+        Min = 0.1, Max = 2.0, Precision = 2, Suffix = " s",
+        Callback = function(v) CFG.Blatant.StanceTime = v end,
+        Desc = "how long G is held, contest builds while you stand in it" })
       slider(s4, { Name = "Hold Time", Flag = "BL_HoldTime", Default = CFG.Blatant.HoldTime,
         Min = 0.03, Max = 1.0, Precision = 2, Suffix = " s",
         Callback = function(v) CFG.Blatant.HoldTime = v end,
-        Desc = "how long it stays teleported on him, a couple of frames is enough" })
+        Desc = "how long the FAKED POSITION is held, separate from the stance" })
       slider(s4, { Name = "Dunk Rise", Flag = "BL_DunkRise", Default = CFG.Blatant.DunkRise,
         Min = 0, Max = 8, Precision = 1, Suffix = " stds",
         Callback = function(v) CFG.Blatant.DunkRise = v end,
